@@ -9,9 +9,45 @@ public struct PageLocation: Codable, Sendable, Equatable {
     public let slug: String
     public let url: String
 
-    public init(slug: String, url: String) {
+    /// When the page stops being served, or nil for one that is kept until it is deleted.
+    ///
+    /// Reading this rather than computing it from the `--ttl` that was sent is the point: the
+    /// server resolves the deadline against *its* clock at the moment of the upload, it applies
+    /// its own default when the caller expressed no opinion, and on `update` it reports the
+    /// deadline the page already had — a number this side never knew.
+    ///
+    /// Nil covers two wire shapes, and they mean the same thing. The server sends an explicit
+    /// `null` for a permanent page; a deployment older than page expiry omits the key, and on
+    /// that server nothing expires either. Both are honestly "no deadline".
+    public let expiresAt: Date?
+
+    private enum CodingKeys: String, CodingKey {
+        case slug, url
+        /// The server's spelling. One key on the wire in both directions, so the `--json` this
+        /// tool prints is the shape it reads.
+        case expiresAt = "expires"
+    }
+
+    public init(slug: String, url: String, expiresAt: Date? = nil) {
         self.slug = slug
         self.url = url
+        self.expiresAt = expiresAt
+    }
+
+    /// Hand-written for the one line in the middle, and for the reason the server hand-writes
+    /// its own encoder: the synthesised version calls `encodeIfPresent`, which *drops the key*
+    /// when there is no deadline — so `stele publish --json` on a permanent page would emit a
+    /// blob with no `expires` in it, and whatever read that blob could not tell "this page is
+    /// kept" from "this tool has nothing to say about lifetimes". An explicit null says which.
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(slug, forKey: .slug)
+        try container.encode(url, forKey: .url)
+        if let expiresAt {
+            try container.encode(expiresAt, forKey: .expiresAt)
+        } else {
+            try container.encodeNil(forKey: .expiresAt)
+        }
     }
 }
 

@@ -41,6 +41,21 @@ enum PageIO {
         // Deliberately bare. A prefix, a checkmark or a colour here would all have to be
         // stripped by whatever consumes it, and the URL is the answer.
         Terminal.out(location.url)
+        // The deadline goes to stderr, because stdout is the URL and nothing else. Printed at
+        // all because the server's default is *ephemeral* — a page published with no --ttl is
+        // eventually unpublished, and a caller handed only a URL would find that out when the
+        // link broke. The date comes from the response rather than from a default repeated
+        // here, so this line stays true on the day the server changes its mind.
+        Terminal.error(options.style.dim(lifetime(location)))
+    }
+
+    /// How a page's deadline reads under the URL.
+    ///
+    /// Absolute, never "in 7 days", for the reason `Format.moment` already gives: the follow-up
+    /// question to a relative date is always "so what date is that".
+    private static func lifetime(_ location: PageLocation) -> String {
+        guard let expiry = location.expiresAt else { return "kept until deleted" }
+        return "expires \(Format.moment(expiry))"
     }
 }
 
@@ -54,6 +69,10 @@ struct PublishCommand: SteleCommand {
             The content type is taken from the file's extension and can be overridden with \
             --content-type. That decision belonging to the CLI is the point: the `curl` recipe \
             this replaces needed an explicit header, and sending the wrong one earned a 415.
+
+            Pages are ephemeral unless you say otherwise. With no --ttl the server applies its \
+            own default lifetime and the page eventually stops being served; --ttl never keeps \
+            it. Whichever it is, the deadline is printed on stderr under the URL.
 
             Exits 5 if --slug is already taken — choose another, or omit it and let the server \
             allocate a three-word one.
@@ -85,13 +104,35 @@ struct PublishCommand: SteleCommand {
     )
     var contentType: String?
 
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "How long the page lives: a number of days, or 'never'.",
+            discussion: """
+                30 and 30d both mean thirty days; 2w means fourteen. Omit it to take the \
+                server's default, which is a matter of days — pass 'never' for a link you \
+                expect to keep. The server has the last word on the maximum.
+                """,
+            valueName: "days"
+        ),
+        completion: .list([PageTTL.neverKeyword, "7", "30", "90"])
+    )
+    var ttl: String?
+
     func execute() async throws {
         let page = try PageIO.read(file)
+        // Parsed before the file is sent rather than after: a lifetime this side can already
+        // tell is unusable should not cost an upload, and the message it earns here names the
+        // spelling to use instead.
+        let lifetime = try ttl.map { raw -> PageTTL in
+            do { return try PageTTL.parse(raw) } catch { throw Failure("\(error)") }
+        }
         let credential = try options.credential()
         let location = try await SteleClient(credential: credential).publish(
             page: page,
             contentType: contentType ?? ContentType.inferred(fromPath: file),
             slug: slug,
+            ttl: lifetime,
             using: credential
         )
         try PageIO.report(location, options: options)
@@ -106,6 +147,10 @@ struct UpdateCommand: SteleCommand {
             Never creates a page: an update to a slug that does not exist exits 7 rather than \
             quietly publishing at a URL nobody has seen. Publish it with `stele publish --slug \
             <name>` first if that is what you meant.
+
+            There is no --ttl here. A page's lifetime is fixed when it is published, so \
+            replacing the body cannot buy the link more time; the deadline it already has is \
+            printed under the URL. Republish it if you need a different one.
             """
     )
 

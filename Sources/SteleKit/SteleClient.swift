@@ -83,13 +83,22 @@ public struct SteleClient: Sendable {
     /// through — and a copy of them in this repository would be a second source of truth that
     /// drifts silently the first time the server relaxes one. A bad slug comes back as a `400`
     /// whose message says which rule it broke.
+    ///
+    /// `ttl` is nil for "no opinion", which is not the same as `.never`: an absent parameter
+    /// takes the server's own default lifetime, and only `.never` asks for a page that is kept
+    /// until it is deleted. The returned `PageLocation` carries the deadline the server settled
+    /// on either way, which is the only place the answer exists.
     public func publish(
         page: Data,
         contentType: String = SteleClient.defaultContentType,
         slug: String? = nil,
+        ttl: PageTTL? = nil,
         using credential: Credential
     ) async throws -> PageLocation {
-        let query = slug.map { [URLQueryItem(name: "slug", value: $0)] } ?? []
+        var query = slug.map { [URLQueryItem(name: "slug", value: $0)] } ?? []
+        if let ttl {
+            query.append(URLQueryItem(name: PageTTL.queryParameter, value: ttl.queryValue))
+        }
         return try await send(
             method: "POST",
             path: Path.pages,
@@ -103,6 +112,10 @@ public struct SteleClient: Sendable {
     }
 
     /// `PUT /pages/:slug`. Replaces a page that already exists; never creates one.
+    ///
+    /// Takes no `ttl`, and not by omission — the server answers `?ttl=` on this verb with a
+    /// `400`. A page's deadline is fixed when it is published, so replacing the body cannot
+    /// quietly buy the link another week. The response still reports the deadline the page has.
     public func update(
         slug: String,
         page: Data,

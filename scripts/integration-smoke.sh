@@ -90,6 +90,21 @@ expect_contains() {
 }
 
 # json_field <file> <dotted.path> — prints the value, or the empty string for null/absent.
+# json_key_state <file> <key> -> "absent", "null", or "set".
+#
+# `json_field` collapses a null and a missing key to the same empty string, and for `expires`
+# that is exactly the distinction worth testing: the synthesised `Encodable` would *drop* the
+# key for a page that is kept, leaving a reader unable to tell "no deadline" from "this tool
+# has no opinion about deadlines". Both ends hand-write an encoder to say null out loud.
+json_key_state() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+document = json.load(open(sys.argv[1]))
+key = sys.argv[2]
+print("absent" if key not in document else "null" if document[key] is None else "set")
+PY
+}
+
 json_field() {
     python3 - "$1" "$2" <<'PY'
 import json, sys
@@ -127,10 +142,16 @@ PY
 }
 
 # Runs the CLI and captures its exit status without tripping `set -e`-style aborts.
-# Output goes to $OUT, status to $STATUS.
+# stdout goes to $OUT, stderr to $ERR, status to $STATUS.
+#
+# The two streams are kept apart rather than merged, because the split is itself a promise this
+# tool makes: stdout carries the URL and nothing else, so `url=$(stele publish page.html)`
+# works. Merging them here would have hidden a regression that put a second line on stdout.
 run_stele() {
-    OUT="$("$STELE_BIN" "$@" --host "$HOST" 2>&1)"
+    ERR_FILE="$WORK/stderr"
+    OUT="$("$STELE_BIN" "$@" --host "$HOST" 2>"$ERR_FILE")"
     STATUS=$?
+    ERR="$(cat "$ERR_FILE")"
 }
 
 http_status() { curl -sS -o /dev/null -w '%{http_code}' "$@"; }
@@ -280,6 +301,63 @@ fi
 expect_eq "…served as text/html" "text/html; charset=utf-8" \
     "$(curl -sS -o /dev/null -w '%{content_type}' "$URL")"
 
+# The deadline is real output and it is on the *other* stream. Both halves matter: a caller
+# doing `url=$(stele publish page.html)` must not capture it, and a caller watching the
+# terminal must see it — a page published with no --ttl is ephemeral, and being handed a bare
+# URL is how you find that out when the link breaks.
+expect_contains "…and the deadline is reported on stderr" "expires" "$ERR"
+case "$OUT" in
+    *"$(printf '\n')"*) fail "stdout stays one line" "just the URL" "$OUT" ;;
+    *) pass "…while stdout stays the URL and nothing else" ;;
+esac
+
+# ---------------------------------------------------------------------------------
+section "4b. page lifetimes: the default is ephemeral and --ttl is the way out"
+# ---------------------------------------------------------------------------------
+
+# What the server actually stored, not what the CLI printed. `expires` is the server's key and
+# an explicit null is its way of saying "kept" — the distinction the CLI's own encoder keeps.
+run_stele publish "$WORK/page.html" --json
+expect_eq "publish --json exits 0" "0" "$STATUS"
+printf '%s' "$OUT" > "$WORK/page-default.json"
+DEFAULT_EXPIRY="$(json_field "$WORK/page-default.json" expires)"
+expect_eq "a page published with no --ttl is ephemeral by default" "set" \
+    "$(json_key_state "$WORK/page-default.json" expires)"
+expect_eq "…and --json puts nothing on stderr" "" "$ERR"
+
+run_stele publish "$WORK/page.html" --ttl never --json
+expect_eq "--ttl never exits 0" "0" "$STATUS"
+printf '%s' "$OUT" > "$WORK/page-never.json"
+expect_eq "…and the page is kept: an explicit null, not a missing key" "null" \
+    "$(json_key_state "$WORK/page-never.json" expires)"
+
+run_stele publish "$WORK/page.html" --ttl 1
+expect_eq "--ttl 1 exits 0" "0" "$STATUS"
+expect_contains "…and reports a deadline a day out" "expires" "$ERR"
+TTL_URL="$OUT"
+expect_eq "…and the page is served now" "200" "$(http_status "$TTL_URL")"
+
+# A week and a day are different lifetimes, and the CLI must not be quietly sending the same
+# thing for both. Compared through the server's own record rather than the printed line.
+run_stele publish "$WORK/page.html" --ttl 90 --json
+printf '%s' "$OUT" > "$WORK/page-90.json"
+if [ "$(json_field "$WORK/page-90.json" expires)" != "$DEFAULT_EXPIRY" ]; then
+    pass "…and --ttl 90 stores a different deadline than the default"
+else
+    fail "--ttl 90 reaches the server" "a deadline unlike the default" "$DEFAULT_EXPIRY"
+fi
+
+# Refused here, before the upload: nothing is rounded, and no page is created.
+run_stele publish "$WORK/page.html" --ttl 12h
+expect_eq "a sub-day lifetime is refused, exit 1" "1" "$STATUS"
+expect_contains "…and the message says days are the resolution" "whole days" "$ERR"
+expect_eq "…and nothing was published" "" "$OUT"
+
+# Refused there, by the server, which owns the maximum. The CLI keeps no copy of that bound,
+# so this is the leg that proves an over-long lifetime still fails — with the server's number.
+run_stele publish "$WORK/page.html" --ttl 3650000
+expect_eq "a lifetime past the server's ceiling is a 400, exit 1" "1" "$STATUS"
+
 # ---------------------------------------------------------------------------------
 section "5. update replaces it in place"
 # ---------------------------------------------------------------------------------
@@ -299,6 +377,14 @@ if cmp -s "$WORK/page2.html" "$WORK/fetched2.html"; then
 else
     fail "the replacement is what is served" "the second file" "$(diff "$WORK/page2.html" "$WORK/fetched2.html" | head -5)"
 fi
+
+# A page's deadline is set once, at publish. Replacing the body must not buy the link another
+# week — which is why `update` has no --ttl to offer and the server answers `?ttl=` on PUT
+# with a 400 rather than a 200 that ignored it.
+expect_contains "…and still reports the deadline it already had" "expires" "$ERR"
+run_stele update "$SLUG" "$WORK/page2.html" --ttl never
+expect_eq "update has no --ttl to give" "1" "$STATUS"
+expect_contains "…and says so rather than silently extending the page" "--ttl" "$ERR"
 
 # ---------------------------------------------------------------------------------
 section "6. --expires-in survives the round trip"
