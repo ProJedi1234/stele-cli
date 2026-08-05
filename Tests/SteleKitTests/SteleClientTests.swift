@@ -169,6 +169,71 @@ struct SteleClientRequestTests {
         #expect(!clients[0].isUsable())
     }
 
+    /// The header an agent's request is identified by, and the one the server version-gates on.
+    /// Sent on reads too, so a `426` cannot depend on which route was called.
+    @Test("every request identifies the client and says what it will accept")
+    func identityHeaders() async throws {
+        let transport = FakeTransport(status: 200, body: "# stele\n")
+        let client = SteleClient(host: try SteleHost("https://stele.example.com"), transport: transport)
+
+        _ = try await client.fetchSkill()
+
+        let request = try #require(await transport.last)
+        #expect(request.method == "GET")
+        #expect(request.url.absoluteString == "https://stele.example.com/skill")
+        #expect(request.headerFields()["User-Agent"] == SteleVersion.userAgent)
+        #expect(request.headerFields()["Accept"] == "application/json, text/*")
+        // A GET has no body, so a `Content-Type` on it would describe nothing.
+        #expect(request.headerFields()["Content-Type"] == nil)
+    }
+
+    /// No `--slug` means no query at all rather than an empty one: `?slug=` is a *requested*
+    /// slug the server would then have to reject, not an absent one.
+    @Test("publishing without a slug sends no query")
+    func noSlugMeansNoQuery() async throws {
+        let transport = FakeTransport(status: 201, body: #"{"slug":"a-b-c","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.publish(page: Data("x".utf8), using: credential)
+
+        #expect(try #require(await transport.last).url.query == nil)
+    }
+
+    /// `auth status` is the first thing an agent runs and it holds a publish-only credential, so
+    /// this route sits under `/admin` for the server's reservation and is not an `admin` scope.
+    @Test("verifying a credential asks the server who it thinks we are")
+    func whoami() async throws {
+        let transport = FakeTransport(
+            status: 200, body: #"{"name":"claude-code","scopes":["publish"]}"#
+        )
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        let summary = try await client.verifyCredential(credential)
+
+        #expect(summary.name == "claude-code")
+        let request = try #require(await transport.last)
+        #expect(request.method == "GET")
+        #expect(request.url.absoluteString == "https://stele.example.com/admin/whoami")
+        #expect(request.headerFields()["Authorization"] != nil)
+    }
+
+    /// The content type is a parameter with a default, not a constant: `stele publish notes.md`
+    /// has to be able to say what it is publishing.
+    @Test("an explicit content type is what gets sent")
+    func explicitContentType() async throws {
+        let transport = FakeTransport(status: 201, body: #"{"slug":"a-b-c","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.publish(
+            page: Data("# hi".utf8), contentType: "text/markdown", using: credential
+        )
+
+        #expect(try #require(await transport.last).headerFields()["Content-Type"] == "text/markdown")
+    }
+
     @Test("revoking posts to the client's revoke sub-resource")
     func revoke() async throws {
         let transport = FakeTransport(
@@ -223,6 +288,81 @@ struct SteleErrorMappingTests {
     func advice(_ status: Int, _ expected: String) async throws {
         let error = try #require(await failure(status: status) as? SteleError)
         #expect(error.description.contains(expected))
+    }
+
+    /// The table asserted as identity rather than as prose. A status mapped to a *plausible but
+    /// wrong* case — `413` to `unsupportedContentType`, say — still produces a description full
+    /// of confident advice, and the advice is for the wrong problem. The exit code the executable
+    /// picks comes off the case too, so this is the assertion the `$?` contract rests on.
+    @Test(
+        "each status maps to its own case",
+        arguments: [
+            (400, SteleError.badRequest("m")),
+            (401, .unauthorized),
+            (403, .forbidden(missing: .publish, detail: "m")),
+            (404, .notFound(detail: "m", advice: SteleError.Expectation.write.notFoundAdvice)),
+            (409, .slugTaken("m")),
+            (413, .pageTooLarge("m")),
+            (415, .unsupportedContentType("m")),
+            (426, .upgradeRequired("m")),
+            (503, .slugAllocationFailed("m")),
+            (418, .unexpectedStatus(code: 418, detail: "m")),
+            (500, .unexpectedStatus(code: 500, detail: "m")),
+        ]
+    )
+    func statusIdentity(_ status: Int, _ expected: SteleError) {
+        #expect(SteleError.from(status: status, detail: "m", expectation: .write) == expected)
+    }
+
+    /// The mapping is what decides whether a call succeeded, so the 2xx range has to be a
+    /// non-answer rather than an `unexpectedStatus` for the codes nobody thought to list.
+    @Test("no 2xx is an error", arguments: [200, 201, 202, 204, 299])
+    func successIsNotAnError(_ status: Int) {
+        #expect(SteleError.from(status: status, detail: nil, expectation: .write) == nil)
+    }
+
+    /// The two statuses whose meaning depends on what was asked. A `404` from `stele update`
+    /// means the page was never published; a `404` from an admin call means the client name is
+    /// wrong, and "publish it first" would be nonsense advice for it.
+    @Test("403 and 404 say different things depending on what was being attempted")
+    func adviceFollowsTheOperation() throws {
+        let write = try #require(SteleError.from(status: 404, detail: nil, expectation: .write))
+        let admin = try #require(
+            SteleError.from(status: 404, detail: nil, expectation: .administration)
+        )
+        #expect(write.description.contains("stele publish"))
+        #expect(admin.description.contains("stele admin clients list"))
+
+        let forbiddenWrite = try #require(
+            SteleError.from(status: 403, detail: nil, expectation: .write)
+        )
+        let forbiddenAdmin = try #require(
+            SteleError.from(status: 403, detail: nil, expectation: .administration)
+        )
+        #expect(forbiddenWrite.description.contains("`publish` scope"))
+        #expect(forbiddenAdmin.description.contains("`admin` scope"))
+    }
+
+    /// The reader is an agent choosing between retrying, changing the input and stopping to ask
+    /// a human, and a message that describes the failure without naming one of those has told it
+    /// nothing it can act on. The list is that vocabulary, not a style rule.
+    @Test("every case's description names a next step")
+    func everyDescriptionIsActionable() throws {
+        let imperatives = ["retry", "check", "fix", "choose", "drop", "publish", "ask the user", "reinstall"]
+        var seen: [SteleError] = []
+        for status in [400, 401, 403, 404, 409, 413, 415, 426, 503, 500] {
+            seen.append(try #require(SteleError.from(status: status, detail: nil, expectation: .write)))
+        }
+        seen.append(.transportFailure(host: try SteleHost("https://stele.example.com"), reason: "refused"))
+        seen.append(.malformedResponse("not JSON"))
+
+        for error in seen {
+            let description = error.description.lowercased()
+            #expect(
+                imperatives.contains(where: description.contains),
+                "no next step in: \(error.description)"
+            )
+        }
     }
 
     /// A 401 says the credential was rejected and never which credential — and the case has no

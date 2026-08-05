@@ -25,6 +25,12 @@ public struct SteleHost: Sendable, Hashable, Comparable, CustomStringConvertible
     /// becomes a dictionary key that a credential is filed under, and silently choosing a
     /// scheme would file `http` and `https` against the same deployment under two keys, or the
     /// same key under two schemes, depending on which way the default fell.
+    ///
+    /// The rejected value is scrubbed before it becomes the error's payload, because the most
+    /// likely way to land here is a human pasting the token at `login`'s host prompt — one line
+    /// above the token prompt, on the machine the credential is for. Echoing it back would put a
+    /// live credential on the terminal, in the scrollback and in whatever transcript is running,
+    /// which is the exact accident this tool exists to prevent.
     public init(_ raw: String) throws(CredentialsError) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let components = URLComponents(string: trimmed),
@@ -32,7 +38,7 @@ public struct SteleHost: Sendable, Hashable, Comparable, CustomStringConvertible
               scheme == "http" || scheme == "https",
               let host = components.host?.lowercased(),
               !host.isEmpty
-        else { throw .invalidHost(raw) }
+        else { throw .invalidHost(Redaction.scrub(raw)) }
 
         var canonical = "\(scheme)://\(host)"
         // Only a non-default port survives. `https://h:443` and `https://h` are one deployment
@@ -381,16 +387,25 @@ public struct CredentialStore: Sendable {
     /// It is also the shape the plan specifies, and the file is a contract with the user's
     /// text editor once it exists.
     static func decode(_ data: Data, path: String) throws(CredentialsError) -> Credentials {
+        /// Every reason below is assembled out of the file's own bytes — a key it read, or a
+        /// parser's `localizedDescription` quoting the text it choked on — and those bytes are a
+        /// credential file. So each one goes through the scrubber on its way into the error,
+        /// rather than relying on this function never happening to include the token: this is
+        /// the message most likely to be printed on the machine the credential lives on.
+        func malformed(_ reason: String) -> CredentialsError {
+            .malformed(path: path, reason: Redaction.scrub(reason))
+        }
+
         let object: [String: Any]
         do {
             guard let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw CredentialsError.malformed(path: path, reason: "the top level is not an object")
+                throw malformed("the top level is not an object")
             }
             object = parsed
         } catch let error as CredentialsError {
             throw error
         } catch {
-            throw .malformed(path: path, reason: error.localizedDescription)
+            throw malformed(error.localizedDescription)
         }
 
         var entries: [SteleHost: Credentials.Entry] = [:]
@@ -399,7 +414,7 @@ public struct CredentialStore: Sendable {
         for (key, value) in object {
             if key == Credentials.defaultHostKey {
                 guard let raw = value as? String else {
-                    throw .malformed(path: path, reason: "'default' is not a host string")
+                    throw malformed("'default' is not a host string")
                 }
                 defaultRaw = raw
                 continue
@@ -410,15 +425,13 @@ public struct CredentialStore: Sendable {
             else {
                 // Names the key and never the value: this is the one place in the library
                 // where a message is assembled from bytes that include a token.
-                throw .malformed(
-                    path: path, reason: "the entry for '\(key)' has no 'client' and 'token'"
-                )
+                throw malformed("the entry for '\(key)' has no 'client' and 'token'")
             }
             guard let host = try? SteleHost(key) else {
-                throw .malformed(path: path, reason: "'\(key)' is not a host URL")
+                throw malformed("'\(key)' is not a host URL")
             }
             guard let token = try? Token(token) else {
-                throw .malformed(path: path, reason: "the token for '\(key)' is not a usable token")
+                throw malformed("the token for '\(key)' is not a usable token")
             }
             entries[host] = Credentials.Entry(clientName: client, token: token)
         }
@@ -429,7 +442,7 @@ public struct CredentialStore: Sendable {
         var defaultHost: SteleHost?
         if let defaultRaw {
             guard let parsed = try? SteleHost(defaultRaw) else {
-                throw .malformed(path: path, reason: "'default' is not a host URL")
+                throw malformed("'default' is not a host URL")
             }
             defaultHost = entries[parsed] != nil ? parsed : nil
         }

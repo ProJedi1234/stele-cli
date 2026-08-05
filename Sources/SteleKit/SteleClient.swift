@@ -273,10 +273,14 @@ public struct SteleClient: Sendable {
         do {
             response = try await transport.send(request)
         } catch let error as TransportError {
-            throw SteleError.transportFailure(host: host, reason: error.reason)
+            // Scrubbed like a server's message, and for a stronger reason: `SteleTransport` is a
+            // public protocol, so this string can come from a conformer written outside this
+            // library — a logging decorator, someone's fake — and "no error carries a token" has
+            // to hold for a transport this library did not write.
+            throw SteleError.transportFailure(host: host, reason: Redaction.scrub(error.reason))
         } catch {
             throw SteleError.transportFailure(
-                host: host, reason: URLSessionTransport.reason(for: error)
+                host: host, reason: Redaction.scrub(URLSessionTransport.reason(for: error))
             )
         }
 
