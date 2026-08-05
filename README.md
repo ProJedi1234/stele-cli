@@ -20,12 +20,50 @@ https://stele.example.com/quiet-cedar-otter
 
 ## Commands
 
-Scaffolding only so far — the command tree lands in later commits. See the implementation plan
-for the intended shape (`auth login/status/logout`, `publish`, `update`, `skill`, and
-`admin clients` for the operator).
+| Command | Who runs it | Does |
+| --- | --- | --- |
+| `stele auth login [--host <url>]` | human, once | Prompts for the token on a TTY, verifies it against the server, writes the credential `0600`. |
+| `stele auth status` | agent or human | Host, client name, scopes, expiry — never the token. |
+| `stele auth logout` | human | Forgets the local credential. Does not revoke it. |
+| `stele publish <file> [--slug <name>]` | agent | `POST /pages`. Prints the URL and nothing else. |
+| `stele update <slug> <file>` | agent | `PUT /pages/:slug`. Never creates. |
+| `stele skill` | agent | Proxies `GET /skill`, so the binary keeps zero copies of the contract. |
+| `stele admin clients create <name>` | operator | Mints a credential and prints the token **once**. `--scopes`, `--expires-in 90d`. |
+| `stele admin clients list` | operator | Names, scopes, last use, revocation state. |
+| `stele admin clients revoke <name>` | operator | Stops a credential working, keeping its record. |
 
-Every command takes `--json` and emits the same models. Styling is a presentation layer only;
-the core operations return plain data and print nothing.
+Every command takes `--host` and `--json`. Styling is a presentation layer only; the core
+operations in `SteleKit` return plain data and print nothing, which is what makes `--json` a
+rendering choice rather than a second code path — and JSON output is never styled, because it is
+a machine contract.
+
+Only the URL, the JSON and the skill document go to stdout. Prompts, warnings and errors go to
+stderr, so `url=$(stele publish page.html)` captures a URL and `stele skill | less` pages a
+document.
+
+## Exit codes
+
+The primary reader of this tool is an agent, and an agent branches on `$?` before it reads
+prose. So outcomes with different next steps get different codes; `stele --help` prints the same
+table.
+
+| | |
+| --- | --- |
+| 0 | success |
+| 1 | failed — read the message, fix the input, do not retry |
+| 2 | no usable credential here — ask the user to run `stele auth login` |
+| 3 | the server rejected the credential — ask the user to log in again |
+| 4 | valid credential, insufficient scope — an operator has to run this |
+| 5 | that slug is taken — choose another `--slug` or omit it |
+| 6 | the page is too large or the wrong type |
+| 7 | no such page or client |
+| 8 | the CLI is too old — reinstall it and retry once |
+| 9 | could not reach the server — retryable |
+| 10 | the server failed — retry once, then stop |
+
+Code 8 is the version gate: the CLI sends `User-Agent: stele-cli/<version>` on every request and
+a server whose `minimumCLIVersion` is higher answers `426`. The remedy is printed with the
+error — `make -C ~/repos/stele-cli install`, then retry once.
 
 ## Credentials
 
@@ -33,11 +71,23 @@ the core operations return plain data and print nothing.
 Three rules make the custody boundary real:
 
 - **The token is never an argument.** `auth login` reads it from a TTY, because argv is visible
-  in `ps` and lands in shell history — and shell history is something an agent reads.
+  in `ps` and lands in shell history — and shell history is something an agent reads. There is
+  no `--token` flag to reach for, and a non-TTY stdin is refused rather than read: `echo $TOKEN |
+  stele auth login` would put the credential straight back into the environment and the history
+  this design removes it from.
 - **Loose permissions are refused.** A group- or world-readable credential file is an error, the
   way `ssh` treats a private key, not a warning to proceed past.
-- **No subcommand ever prints the token**, including `auth status` and including error paths. A
-  401 says the credential was rejected, not which credential.
+- **No subcommand ever prints the token**, including `auth status`, including `--json`, and
+  including error paths. A 401 says the credential was rejected, not which credential. This is
+  enforced by access control rather than by care: `Token`'s plaintext accessors are `internal`
+  to `SteleKit`, so the executable — which is where every `print` lives — has no expression that
+  yields it.
+
+  The one exception is `admin clients create`, which must print the token it just minted because
+  the server keeps only a SHA-256 and cannot reissue it. That path goes through `MintedToken`, a
+  separate type whose `.secret` is the library's only public accessor, spelled out at the call
+  site so it is the line a reviewer stops on. It is in the `--json` payload too — omitting it
+  there would make `--json` a quiet way to lose a credential you just created.
 
 This stops *accidental* exposure — echoed commands, transcripts, a token pasted into a page —
 which is where essentially every real leak comes from. It does not stop an agent that decides to

@@ -215,7 +215,7 @@ struct SteleErrorMappingTests {
             (409, "--slug"),
             (413, "link them instead"),
             (415, "content type"),
-            (426, "make install"),
+            (426, "make -C ~/repos/stele-cli install"),
             (503, "Retry once"),
             (500, "no advice for"),
         ]
