@@ -8,7 +8,7 @@
 public enum SteleVersion {
     /// Bumped by hand. Nothing derives it from git: a release built from a tarball or an
     /// unclean tree must still report a version the server can compare.
-    public static let current = "0.1.0"
+    public static let current = "0.2.0"
 
     /// Sent on every request. The `stele-cli/` product token is what the server matches on.
     public static var userAgent: String { "stele-cli/\(current)" }
