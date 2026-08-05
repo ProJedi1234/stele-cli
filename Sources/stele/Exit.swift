@@ -95,8 +95,8 @@ enum Exit {
     /// `String(describing:)` rather than a cast to `CustomStringConvertible` — every `Error` is
     /// already convertible, so the cast never fails and the conditional would read as a
     /// fallback that does not exist. What actually matters is that `SteleError`,
-    /// `CredentialsError` and `Failure` each write a `description` ending in an instruction, and
-    /// `String(describing:)` prefers it.
+    /// `CredentialsError`, `PromptError` and `Failure` each write a `description` ending in an
+    /// instruction, and `String(describing:)` prefers it.
     static func describe(_ error: any Error) -> String {
         String(describing: error)
     }
@@ -127,10 +127,15 @@ enum Exit {
             case .unreadable, .writeFailed, .invalidHost, .emptyToken, .malformedToken:
                 return failure
             }
-        // A prompt this program refused to fake. Same signal as an empty credential file,
-        // because the remedy is the same person doing the same thing.
-        case is NeedsHuman:
-            return noCredential
+        case let error as PromptError:
+            switch error {
+            // A prompt this program refused to fake. Same signal as an empty credential file,
+            // because the remedy is the same person doing the same thing — and an agent that
+            // saw the generic `1` here would retry the pipe it just had refused.
+            case .notATerminal: return noCredential
+            // A human was there and gave nothing. "Fix the input and try again" is exactly right.
+            case .nothingEntered: return failure
+            }
         default:
             return failure
         }

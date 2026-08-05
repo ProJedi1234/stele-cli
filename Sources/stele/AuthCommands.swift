@@ -50,7 +50,7 @@ struct LoginCommand: SteleCommand {
         var credentials = try options.store.load()
         let host = try resolveHost(existing: credentials)
 
-        let raw = try Prompt.secret("token for \(host): ")
+        let raw = try Prompt().secret("token for \(host): ")
         // `Token` refuses an empty or header-unsafe value here, before anything is sent and
         // long before anything is written.
         let token = try Token(raw)
@@ -99,7 +99,7 @@ struct LoginCommand: SteleCommand {
                     + "--host <url>."
             )
         }
-        return try SteleHost(try Prompt.line("host (e.g. https://stele.example.com): "))
+        return try SteleHost(try Prompt().line("host (e.g. https://stele.example.com): "))
     }
 }
 

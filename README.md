@@ -92,10 +92,27 @@ error — `make -C ~/repos/stele-cli install`, then retry once.
 
 ## Configuration
 
-**There are no environment variables.** Not one, and there is no `STELE_TOKEN` escape hatch for
-CI either: an env-var fallback would reopen the exact hole this tool closes, and it would get
-used, because it is easier. The credential file is the only configuration this program has, and
-whatever an env var would have answered, it answers instead.
+**No environment variable configures the credential, the token or the host.** Not one, and there
+is no `STELE_TOKEN` escape hatch for CI either: an env-var fallback would reopen the exact hole
+this tool closes, and it would get used, because it is easier. The credential file is the only
+configuration this program has, and whatever an env var would have answered, it answers instead.
+
+The claim is that precise because it is the checkable one. The program does read the
+environment, in two places that could not carry a secret if they tried: `NO_COLOR`, `TERM` and
+`COLORTERM` decide whether output is styled, and `SAP_SHELL` tells the completion generator which
+shell asked. Neither names a host, and neither can supply a token. "There are no environment
+variables" would be a tidier sentence and a false one, and a security claim that is false in a
+detail is one a reader is right to stop trusting in general.
+
+**`HOME` is not one of them, which is worth stating because it is the natural guess.** The
+credential file's directory comes from `NSHomeDirectory()`, and on Linux — the platform the
+agents run on — that resolves through the passwd database (`getpwuid(getuid())->pw_dir`) rather
+than reading `$HOME`. Checked, not assumed: `HOME=/tmp/elsewhere stele auth status --json` still
+reports the real user's path in `credentialFile`. So there is no environment variable anywhere
+that relocates the credential — a stronger property than the one a reader would assume, with one
+practical consequence worth knowing before it surprises you: a script cannot sandbox this program
+into a temp home. Anything needing to run against a scratch credential has to move the real file
+aside and put it back, which is exactly what `scripts/integration-smoke.sh` does.
 
 `~/.config/stele/credentials.json`, keyed by host so one file can hold several deployments:
 
@@ -112,9 +129,11 @@ key breaks the tie when it holds several, and `--host` overrides per invocation.
 guessed: several hosts with no default is an error naming them, because a `stele publish` whose
 destination depends on something invisible is worse than one that stops and asks.
 
-There is deliberately no `XDG_CONFIG_HOME` support. "This program reads no environment
-variables" is a claim worth being able to make without an asterisk, and a relocatable credential
-path is also a way to point an agent at a file the user did not write.
+There is deliberately no `XDG_CONFIG_HOME` support, and — per the note above — no `HOME` support
+either. A variable that *relocates* the credential file is a way to point an agent at a
+credential the user did not write, and it turns "where is my credential?" into a question with an
+invisible answer. The file is where the user's account says it is, and nothing in the environment
+moves it.
 
 Three rules make the custody boundary real:
 
@@ -202,3 +221,51 @@ parameter — the home directory into `CredentialStore`, the transport into `Ste
 suite covers the credential file's permissions and host resolution, the request each command
 builds, the status-code vocabulary, and the promise the whole project rests on: that no
 rendering of a credential, and no case of any error type, can be made to print a token.
+
+### The integration smoke test
+
+`swift test` cannot catch a disagreement with the server, and this is not a hypothetical: every
+assertion in it runs against a `FakeTransport` whose expectations were written from *this*
+repository's code. A field name spelled differently from the server's is therefore wrong in the
+client and wrong in the test that checks the client, and both halves agree with each other all
+the way to the first live request. That is how four contract breaks once shipped with two green
+suites — including a `--expires-in` that travelled under a key the server ignored, earning a
+cheerful `201` and a credential that never expired.
+
+The fix is the one thing no unit test can do: drive the real binary against a real server.
+
+```sh
+scripts/integration-smoke.sh --host http://127.0.0.1:8099 --token "$TEST_TOKEN"
+```
+
+It boots nothing — point it at a server that is already running and give it that deployment's
+`STELE_UPLOAD_TOKEN`, which is the documented bootstrap credential and the only thing that can
+mint the first client. Arguments may also arrive as `STELE_SMOKE_HOST`, `STELE_SMOKE_TOKEN`,
+`STELE_BIN` and `STELE_SMOKE_PSQL`.
+
+| Flag | | |
+| --- | --- | --- |
+| `--host <url>` | required | The server under test. |
+| `--token <value>` | required | Its `STELE_UPLOAD_TOKEN`. **A test-run token, never a real one.** |
+| `--bin <path>` | optional | The binary to drive; defaults to `stele` on `PATH`. Use `.build/release/stele` to test what you just built rather than what is installed. |
+| `--psql <command>` | optional | A command that reaches the server's database, e.g. `docker exec stele-postgres psql -U stele -d stele_smoke`. Only the attribution check needs it, because no route reports who wrote a page — without it that one check prints `skip`. |
+
+It walks the whole documented lifecycle — mint, log in, `auth status`, publish, fetch the bytes
+back and compare them, update, `--expires-in` there *and* back, expiry actually enforced, a
+publish-only credential answered `200` by whoami and `403` by the admin routes, revocation that
+really stops working, the exit-code vocabulary, the version gate, and the byte-identity of every
+`404`. It prints each check, stops at the first failure, and exits non-zero.
+
+Two things it does not do, stated because a canary you trust wrongly is worse than none:
+
+- **It cannot drive `stele auth login` interactively.** That command demands a TTY by design and
+  refuses a pipe; the script asserts the *refusal* — which is the load-bearing custody rule — and
+  then seeds the credential file at `0600` in the documented format for the rest of the run. The
+  prompt, the echo-off read and the verify-before-write are not covered.
+- **It leaves litter.** The server has no delete route, so each run leaves two pages and three
+  credential rows behind; it revokes every credential it mints, but a revoked row is still a row.
+  Run it against a throwaway deployment, never against production.
+
+It also moves `~/.config/stele/credentials.json` aside and restores it on every exit path,
+including a failed check — see the `HOME` note under Configuration for why it cannot simply use a
+temp directory instead.

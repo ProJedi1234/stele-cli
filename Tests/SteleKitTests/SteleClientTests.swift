@@ -153,8 +153,8 @@ struct SteleClientRequestTests {
         let transport = FakeTransport(
             status: 200,
             body: """
-                [{"name":"a","scopes":["publish"],"createdAt":"2026-08-04T10:00:00.123Z",
-                  "lastUsedAt":"2026-08-04T11:00:00Z","revokedAt":"2026-08-04T12:00:00Z"}]
+                {"clients":[{"name":"a","scopes":["publish"],"createdAt":"2026-08-04T10:00:00.123Z",
+                  "lastUsedAt":"2026-08-04T11:00:00Z","revokedAt":"2026-08-04T12:00:00Z"}]}
                 """
         )
         let credential = try testCredential()
@@ -200,8 +200,9 @@ struct SteleClientRequestTests {
         #expect(try #require(await transport.last).url.query == nil)
     }
 
-    /// `auth status` is the first thing an agent runs and it holds a publish-only credential, so
-    /// this route sits under `/admin` for the server's reservation and is not an `admin` scope.
+    /// The route sits under `/admin` only because that first segment is reserved server-side; it
+    /// is excluded from the admin-scope group on purpose, since `auth status` is the first thing
+    /// an agent runs and an agent holds a publish-only credential.
     @Test("verifying a credential asks the server who it thinks we are")
     func whoami() async throws {
         let transport = FakeTransport(
@@ -234,7 +235,11 @@ struct SteleClientRequestTests {
         #expect(try #require(await transport.last).headerFields()["Content-Type"] == "text/markdown")
     }
 
-    @Test("revoking posts to the client's revoke sub-resource")
+    /// The verb and the path are the server's, not a shape that reads well from here: the server
+    /// serves `DELETE /admin/clients/:name` and has no `…/revoke` sub-resource at all. This
+    /// suite asserted the invented one for a while and stayed green, which is the failure mode
+    /// worth naming — a fake transport pinned to the client's own guesses tests nothing.
+    @Test("revoking DELETEs the client's own resource")
     func revoke() async throws {
         let transport = FakeTransport(
             status: 200,
@@ -246,10 +251,85 @@ struct SteleClientRequestTests {
         let summary = try await client.revokeClient(name: "old agent", using: credential)
 
         #expect(summary.isRevoked)
-        // The name is percent-encoded into the path rather than pasted into it.
         let revokeRequest = try #require(await transport.last)
-        #expect(revokeRequest.url.path == "/admin/clients/old agent/revoke")
-        #expect(revokeRequest.url.absoluteString.contains("old%20agent"))
+        #expect(revokeRequest.method == "DELETE")
+        #expect(revokeRequest.url.path == "/admin/clients/old agent")
+        // The name is percent-encoded into the path rather than pasted into it.
+        #expect(revokeRequest.url.absoluteString == "https://stele.example.com/admin/clients/old%20agent")
+    }
+
+    /// `GET /admin/clients` answers `{"clients": […]}`, and the server pinned that envelope with
+    /// a test of its own. Decoding a bare array here parsed nothing against a real deployment.
+    @Test("listing decodes the server's envelope rather than a bare array")
+    func listEnvelope() async throws {
+        let transport = FakeTransport(
+            status: 200,
+            body: """
+                {"clients":[{"name":"claude-code","scopes":["publish"],
+                 "createdAt":"2026-08-04T10:00:00Z"}]}
+                """
+        )
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        let clients = try await client.listClients(using: credential)
+
+        #expect(clients.map(\.name) == ["claude-code"])
+        let request = try #require(await transport.last)
+        #expect(request.method == "GET")
+        #expect(request.url.absoluteString == "https://stele.example.com/admin/clients")
+    }
+
+    /// The silent one. The server decodes `expiresIn` and ignores keys it does not recognise, so
+    /// the previous `expiresInSeconds` produced a `201`, a printed token and a credential that
+    /// never expired — no error anywhere. Read off the encoded body, because nothing downstream
+    /// of this line can tell the difference.
+    @Test("--expires-in travels as the server's `expiresIn`, in seconds")
+    func expiresInWireKey() async throws {
+        let transport = FakeTransport(
+            status: 201,
+            body: """
+                {"client":{"name":"temp","scopes":["publish"],
+                 "createdAt":"2026-08-04T10:00:00Z","expiresAt":"2026-11-02T10:00:00Z"},
+                 "token":"stele_pat_minted"}
+                """
+        )
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.createClient(
+            name: "temp", expiresIn: 90 * 24 * 60 * 60, using: credential
+        )
+
+        let request = try #require(await transport.last)
+        let body = try #require(request.body)
+        let sent = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect(sent["expiresIn"] as? Int == 7_776_000)
+        #expect(sent["name"] as? String == "temp")
+        #expect(sent["scopes"] as? [String] == ["publish"])
+        #expect(sent["expiresInSeconds"] == nil)
+    }
+
+    /// No expiry means the key is absent, not `null`: the server reads its absence as "does not
+    /// expire", and an explicit null would be a second spelling of the same thing.
+    @Test("no --expires-in sends no expiry key at all")
+    func expiresInOmitted() async throws {
+        let transport = FakeTransport(
+            status: 201,
+            body: """
+                {"client":{"name":"temp","scopes":["publish"],
+                 "createdAt":"2026-08-04T10:00:00Z"},"token":"stele_pat_minted"}
+                """
+        )
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.createClient(name: "temp", using: credential)
+
+        let request = try #require(await transport.last)
+        let body = try #require(request.body)
+        let sent = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect(sent["expiresIn"] == nil)
     }
 }
 

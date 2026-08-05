@@ -49,15 +49,22 @@ public struct SteleClient: Sendable {
     public enum Path {
         public static let pages = "/pages"
         public static let skill = "/skill"
-        /// Reports the credential the caller presented. Under `/admin` because that segment is
-        /// already reserved server-side, but open to *any* valid credential rather than to the
-        /// `admin` scope — `stele auth status` is the first thing an agent runs, and it holds
-        /// a publish-only credential.
+        /// Reports the credential the caller presented.
+        ///
+        /// It sits under `/admin` because that first segment is already reserved server-side, and
+        /// that placement is the trap worth naming: everything else under `/admin` is behind the
+        /// `admin` scope, so whoami has to be *deliberately excluded* from that group on the
+        /// server. It is open to any valid credential in spite of its path, not because of it.
+        /// `stele auth status` is the first thing an agent runs and it holds a publish-only
+        /// credential — the day this route falls back into the admin group, `auth login` starts
+        /// failing with a `403` for every agent.
         public static let whoami = "/admin/whoami"
         public static let clients = "/admin/clients"
 
         public static func page(slug: String) -> String { "\(pages)/\(slug)" }
-        public static func revoke(client name: String) -> String { "\(clients)/\(name)/revoke" }
+        /// One credential, addressed by name — the handle every admin route uses. `GET` is not
+        /// offered; `DELETE` here is what revokes.
+        public static func client(named name: String) -> String { "\(clients)/\(name)" }
     }
 
     /// The type a page body is sent as when the caller expresses no opinion.
@@ -173,7 +180,7 @@ public struct SteleClient: Sendable {
         let payload = CreateClientRequest(
             name: name,
             scopes: scopes.map(\.rawValue),
-            expiresInSeconds: expiresIn.map { Int($0.rounded()) }
+            expiresIn: expiresIn.map { Int($0.rounded()) }
         )
         return try await send(
             method: "POST",
@@ -196,22 +203,24 @@ public struct SteleClient: Sendable {
             path: Path.clients,
             credential: credential,
             expectation: .administration,
-            decoding: [ClientSummary].self
-        )
+            decoding: ClientListResponse.self
+        ).clients
     }
 
-    /// `POST /admin/clients/:name/revoke` — stop a credential working, keeping its row.
+    /// `DELETE /admin/clients/:name` — stop a credential working, keeping its row.
     ///
-    /// A `POST` to a sub-resource rather than a `DELETE` on the client, because revocation is
-    /// not deletion: the row survives with `revoked_at` set, which is what lets the list
-    /// answer "this one was retired in March" instead of forgetting the credential existed.
+    /// A `DELETE` even though nothing is deleted: revocation is the only kind of removal this
+    /// collection has, and what it removes is the credential's ability to authenticate. The row
+    /// survives with `revoked_at` set, which is what lets the list answer "this one was retired
+    /// in March" instead of forgetting the credential existed. The server answers with the
+    /// revoked record, and revoking twice returns the same `revokedAt` rather than moving it.
     public func revokeClient(
         name: String,
         using credential: Credential
     ) async throws -> ClientSummary {
         try await send(
-            method: "POST",
-            path: Path.revoke(client: name),
+            method: "DELETE",
+            path: Path.client(named: name),
             credential: credential,
             expectation: .administration,
             decoding: ClientSummary.self
@@ -223,10 +232,23 @@ public struct SteleClient: Sendable {
     /// The JSON body `createClient` sends. A duration rather than an absolute expiry: the two
     /// clocks involved are the agent's and the server's, and only one of them has to be right
     /// if the client says "90 days from now" and the server does the arithmetic.
+    ///
+    /// The field names are the server's, spelled its way. `expiresIn` — seconds from now — is
+    /// the one that has to be exact rather than merely reasonable: the server ignores keys it
+    /// does not know, so `expiresInSeconds` earned a cheerful `201` and a credential that never
+    /// expired. A wire mismatch that fails silently is why `SteleClientRequestTests` reads the
+    /// encoded body back rather than trusting the call to have travelled.
     private struct CreateClientRequest: Encodable {
         let name: String
         let scopes: [String]
-        let expiresInSeconds: Int?
+        let expiresIn: Int?
+    }
+
+    /// `GET /admin/clients` answers with an object, not a bare array: a JSON array cannot grow a
+    /// sibling field, so the envelope is what lets a cursor or a total appear later without
+    /// breaking every parser. Unwrapped here so callers see the list.
+    private struct ClientListResponse: Decodable {
+        let clients: [ClientSummary]
     }
 
     private func send<T: Decodable>(
