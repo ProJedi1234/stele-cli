@@ -306,10 +306,14 @@ expect_eq "…served as text/html" "text/html; charset=utf-8" \
 # terminal must see it — a page published with no --ttl is ephemeral, and being handed a bare
 # URL is how you find that out when the link breaks.
 expect_contains "…and the deadline is reported on stderr" "expires" "$ERR"
-case "$OUT" in
-    *"$(printf '\n')"*) fail "stdout stays one line" "just the URL" "$OUT" ;;
-    *) pass "…while stdout stays the URL and nothing else" ;;
-esac
+# Counted rather than pattern-matched: `$(printf '\n')` is the empty string — command
+# substitution strips trailing newlines — so the obvious `case` spelling asks whether stdout
+# contains "", which every string does, and the check passes for one line and fails for ten.
+if [ "$(printf '%s' "$OUT" | wc -l)" -eq 0 ]; then
+    pass "…while stdout stays the URL and nothing else"
+else
+    fail "stdout stays one line" "just the URL" "$OUT"
+fi
 
 # ---------------------------------------------------------------------------------
 section "4b. page lifetimes: the default is ephemeral and --ttl is the way out"
@@ -340,6 +344,7 @@ expect_eq "…and the page is served now" "200" "$(http_status "$TTL_URL")"
 # A week and a day are different lifetimes, and the CLI must not be quietly sending the same
 # thing for both. Compared through the server's own record rather than the printed line.
 run_stele publish "$WORK/page.html" --ttl 90 --json
+expect_eq "--ttl 90 exits 0" "0" "$STATUS"
 printf '%s' "$OUT" > "$WORK/page-90.json"
 if [ "$(json_field "$WORK/page-90.json" expires)" != "$DEFAULT_EXPIRY" ]; then
     pass "…and --ttl 90 stores a different deadline than the default"
@@ -383,7 +388,10 @@ fi
 # with a 400 rather than a 200 that ignored it.
 expect_contains "…and still reports the deadline it already had" "expires" "$ERR"
 run_stele update "$SLUG" "$WORK/page2.html" --ttl never
-expect_eq "update has no --ttl to give" "1" "$STATUS"
+# 64, not 1: an option the command does not declare is a usage error, and ArgumentParser exits
+# `EX_USAGE` for those. The distinction is worth pinning — 1 would mean the flag was accepted
+# and something later refused it, which is the outcome this check exists to rule out.
+expect_eq "update has no --ttl to give" "64" "$STATUS"
 expect_contains "…and says so rather than silently extending the page" "--ttl" "$ERR"
 
 # ---------------------------------------------------------------------------------

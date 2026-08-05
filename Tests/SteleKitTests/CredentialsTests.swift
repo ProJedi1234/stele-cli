@@ -241,6 +241,61 @@ struct HostResolutionTests {
         #expect(throws: CredentialsError.self) { try credentials.resolve() }
     }
 
+    /// The regression this suite exists for on the write side. A one-host file carries no
+    /// `default` marker — nothing needs one — so the host that has been answering every bare
+    /// command reloads with `defaultHost == nil`. Reading that nil as "no default yet" is how
+    /// `--no-default` used to hand the default to the very host that declined it, quietly
+    /// repointing the next `stele publish` at the deployment just added.
+    @Test("--no-default leaves the incumbent default alone, marker on disk or not")
+    func decliningKeepsTheIncumbent() throws {
+        let home = try FakeHome()
+        var first = Credentials()
+        first.set(try credential("https://one.example.com", client: "one"))
+        try home.store.save(first)
+
+        var reloaded = try home.store.load()
+        #expect(reloaded.defaultHost == nil)  // one host: the file says nothing, and need not
+        reloaded.set(try credential("https://two.example.com", client: "two"), makeDefault: false)
+
+        let one = try SteleHost("https://one.example.com")
+        #expect(reloaded.defaultHost == one)
+        #expect(try reloaded.resolve().host == one)
+        try home.store.save(reloaded)
+        #expect(try home.store.load().resolve().clientName == "one")
+    }
+
+    /// Declining when there is genuinely nothing to decline in favour of. A hand-edited file
+    /// with several hosts and no marker has no incumbent — `resolve` refuses to guess between
+    /// them — and adding a third with `--no-default` must not resolve that by promoting the new
+    /// one. The ambiguity is the user's to settle, and the error names the command that does it.
+    @Test("--no-default into an ambiguous file leaves it ambiguous")
+    func decliningWithNoIncumbent() throws {
+        let json = """
+            {
+              "https://one.example.com": {"client": "one", "token": "stele_pat_a"},
+              "https://two.example.com": {"client": "two", "token": "stele_pat_b"}
+            }
+            """
+        var credentials = try CredentialStore.decode(Data(json.utf8), path: "test")
+        credentials.set(try credential("https://three.example.com", client: "three"), makeDefault: false)
+
+        #expect(credentials.defaultHost == nil)
+        #expect(throws: CredentialsError.self) { try credentials.resolve() }
+    }
+
+    /// The first login is the exception that keeps the rest simple: with nothing stored, the
+    /// host being added is the only one there is, so it takes the default even when asked not
+    /// to. Anything else would make `auth login --no-default` on a fresh machine store a
+    /// credential that no bare command can reach.
+    @Test("--no-default on a fresh file still leaves a default behind")
+    func decliningOnAFreshFile() throws {
+        var credentials = Credentials()
+        credentials.set(try credential("https://only.example.com", client: "solo"), makeDefault: false)
+
+        #expect(credentials.defaultHost == (try SteleHost("https://only.example.com")))
+        #expect(try credentials.resolve().clientName == "solo")
+    }
+
     @Test("an explicit host wins over the default")
     func overrideWins() throws {
         var credentials = Credentials()

@@ -148,6 +148,52 @@ struct SteleClientRequestTests {
         #expect(request.url.absoluteString == "https://stele.example.com/pages/my-page")
     }
 
+    /// A slug is one path segment and must stay one, however it is spelled. Left raw it is not
+    /// only a `/` away from another route: RFC 3986 removes dot segments before the request is
+    /// ever sent, so `update ../admin/clients` reaches the server as `PUT /admin/clients` — an
+    /// admin route addressed by a page command. The token still travels only to its own host,
+    /// so this is not a leak; it is the request acting on a resource nobody named.
+    @Test(
+        "a slug cannot climb out of /pages",
+        arguments: [
+            ("../admin/clients", "https://stele.example.com/pages/..%2Fadmin%2Fclients"),
+            ("..", "https://stele.example.com/pages/%2E%2E"),
+            (".", "https://stele.example.com/pages/%2E"),
+            ("a/b", "https://stele.example.com/pages/a%2Fb"),
+            ("quiet-cedar-otter", "https://stele.example.com/pages/quiet-cedar-otter"),
+        ]
+    )
+    func slugStaysOneSegment(_ slug: String, _ expected: String) async throws {
+        let transport = FakeTransport(status: 200, body: #"{"slug":"x","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try? await client.update(slug: slug, page: Data("x".utf8), using: credential)
+
+        let request = try #require(await transport.last)
+        #expect(request.url.absoluteString == expected)
+        // The property the escapes above are only instances of: whatever was typed, the request
+        // is still for something under /pages.
+        #expect(request.url.standardized.path.hasPrefix("/pages/"))
+    }
+
+    /// The same rule on the admin side, where the reachable routes are the destructive ones.
+    @Test("a client name cannot climb out of /admin/clients")
+    func clientNameStaysOneSegment() async throws {
+        let transport = FakeTransport(status: 200, body: #"{"name":"x","scopes":[]}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try? await client.revokeClient(name: "../../pages/quiet-cedar-otter", using: credential)
+
+        let request = try #require(await transport.last)
+        #expect(
+            request.url.absoluteString
+                == "https://stele.example.com/admin/clients/..%2F..%2Fpages%2Fquiet-cedar-otter"
+        )
+        #expect(request.url.standardized.path.hasPrefix("/admin/clients/"))
+    }
+
     /// The skill is a read, and reads on this server are unauthenticated — an agent
     /// bootstrapping from it does not have a credential yet.
     @Test("fetching the skill sends no credential")

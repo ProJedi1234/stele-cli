@@ -52,10 +52,15 @@ public struct SteleHost: Sendable, Hashable, Comparable, CustomStringConvertible
         self.value = canonical
     }
 
-    /// Builds a URL under this host. `path` is expected to start with `/`.
+    /// Builds a URL under this host. `path` is expected to start with `/` and to be already
+    /// percent-encoded — `SteleClient.Path` is the only thing that builds one, and it encodes
+    /// the parts that come from a slug or a credential name itself. Assigning to `path` here
+    /// instead would be the bug it is guarding against: that setter treats `/` and `.` as the
+    /// path characters they are, so an encoded segment would have its `%` escaped back into
+    /// `%25` and a slug of `../admin/clients` would sail through as three real segments.
     public func url(path: String, query: [URLQueryItem] = []) -> URL? {
         guard var components = URLComponents(string: value) else { return nil }
-        components.path = path
+        components.percentEncodedPath = path
         components.queryItems = query.isEmpty ? nil : query
         return components.url
     }
@@ -243,10 +248,25 @@ public struct Credentials: Sendable, Equatable {
     /// hand-edited file — which is a state worth handling, since the file is documented and
     /// people edit it.
     public mutating func set(_ credential: Credential, makeDefault: Bool = true) {
+        // Which host was already answering bare commands, read *before* the insert. It is not
+        // simply `defaultHost`: one stored host resolves with no marker at all, and `encode`
+        // leaves the marker out of a one-host file for that reason — so `defaultHost` is
+        // routinely nil while a host is plainly the incumbent. Treating that nil as "no default
+        // yet" is how declining the default used to hand it to the new host, sending the next
+        // bare `stele publish` to the deployment that asked not to be preferred.
+        let incumbent = defaultHost ?? (entries.count == 1 ? entries.keys.first : nil)
         entries[credential.host] = Entry(
             clientName: credential.clientName, token: credential.token
         )
-        if makeDefault || defaultHost == nil { defaultHost = credential.host }
+        if makeDefault {
+            defaultHost = credential.host
+        } else {
+            // The incumbent keeps it. With nothing to keep it — a fresh file, or a hand-edited
+            // one holding several hosts and no marker — the new host takes it only when it is
+            // the only host stored. Otherwise the file stays ambiguous and `resolve` says so,
+            // which is the honest answer: nothing here knows which of the others was meant.
+            defaultHost = incumbent ?? (entries.count == 1 ? credential.host : nil)
+        }
     }
 
     /// Forgets a host's credential. Returns false if there was nothing stored for it, so

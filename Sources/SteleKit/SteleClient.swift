@@ -61,10 +61,38 @@ public struct SteleClient: Sendable {
         public static let whoami = "/admin/whoami"
         public static let clients = "/admin/clients"
 
-        public static func page(slug: String) -> String { "\(pages)/\(slug)" }
+        public static func page(slug: String) -> String { "\(pages)/\(segment(slug))" }
         /// One credential, addressed by name — the handle every admin route uses. `GET` is not
         /// offered; `DELETE` here is what revokes.
-        public static func client(named name: String) -> String { "\(clients)/\(name)" }
+        public static func client(named name: String) -> String { "\(clients)/\(segment(name))" }
+
+        /// Percent-encodes one path segment, so that a name the caller typed stays one segment.
+        ///
+        /// Interpolating it raw is route confusion waiting to happen: `/` and `.` are ordinary
+        /// path characters, and RFC 3986 resolves dot segments before the request goes out, so
+        /// `stele update ../admin/clients page.html` asks for `PUT /admin/clients` and
+        /// `stele admin clients revoke ../../pages/x` asks for `DELETE /pages/x`. The credential
+        /// still only travels to its own host, so nothing leaks — but the resource acted on is
+        /// not the one named, which is its own kind of bad afternoon.
+        ///
+        /// This is encoding, not validation: which slugs are legal remains the server's `Slug`
+        /// type's business, and an illegal one still comes back as a `400` naming the rule it
+        /// broke. A slug that needed encoding was never going to be a real slug anyway.
+        static func segment(_ raw: String) -> String {
+            let encoded = raw.addingPercentEncoding(withAllowedCharacters: segmentAllowed) ?? ""
+            // The other half of dot-segment removal, which needs no `/` to bite: `/pages/..`
+            // resolves to `/` on its own, and `/pages/.` to `/pages`.
+            guard !encoded.isEmpty, encoded.allSatisfy({ $0 == "." }) else { return encoded }
+            return String(repeating: "%2E", count: encoded.count)
+        }
+
+        /// Everything `URLComponents` would leave alone in a path, less `/` — a separator is
+        /// exactly what a segment must not be able to introduce.
+        private static let segmentAllowed: CharacterSet = {
+            var allowed = CharacterSet.urlPathAllowed
+            allowed.remove("/")
+            return allowed
+        }()
     }
 
     /// The type a page body is sent as when the caller expresses no opinion.
