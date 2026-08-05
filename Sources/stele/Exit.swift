@@ -117,7 +117,10 @@ enum Exit {
                 // A 5xx is the server's fault and worth one retry; a 4xx this client has no
                 // case for is the caller's, and retrying it changes nothing.
                 return (500..<600).contains(status) ? serverError : failure
-            case .badRequest: return failure
+            // Not `unreachable`, though it looks adjacent: the server was reached, and the
+            // answer was an instruction this client refused. Retrying gets the same redirect,
+            // so it is "read the message and do not retry" — which is what `failure` means.
+            case .badRequest, .redirected: return failure
             }
         case let error as CredentialsError:
             switch error {

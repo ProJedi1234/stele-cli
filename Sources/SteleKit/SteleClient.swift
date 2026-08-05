@@ -180,7 +180,7 @@ public struct SteleClient: Sendable {
         let payload = CreateClientRequest(
             name: name,
             scopes: scopes.map(\.rawValue),
-            expiresIn: expiresIn.map { Int($0.rounded()) }
+            expiresIn: expiresIn.map(Self.wholeSeconds)
         )
         return try await send(
             method: "POST",
@@ -191,6 +191,23 @@ public struct SteleClient: Sendable {
             expectation: .administration,
             decoding: MintedClient.self
         )
+    }
+
+    /// A lifetime as the whole seconds the request body carries, without trapping.
+    ///
+    /// `Int(someDouble)` outside `Int`'s range is a runtime trap, not an error, and this value
+    /// arrives from a public parameter: `ExpiryDuration` bounds what the CLI can hand in, but
+    /// nothing bounds what another caller of this library can. Clamping keeps an absurd argument
+    /// a rejection from the server — which is the authority on lifetimes anyway — instead of a
+    /// crash on the client.
+    static func wholeSeconds(_ interval: TimeInterval) -> Int {
+        let rounded = interval.rounded()
+        // NaN first and on its own: it compares false against every bound, so a comparison
+        // written to catch it would let it through to the conversion, which traps on NaN too.
+        guard !rounded.isNaN else { return .max }
+        guard rounded > Double(Int.min) else { return .min }
+        guard rounded < Double(Int.max) else { return .max }
+        return Int(rounded)
     }
 
     /// `GET /admin/clients` — every credential the server holds, revoked ones included.
@@ -294,6 +311,13 @@ public struct SteleClient: Sendable {
         let response: SteleResponse
         do {
             response = try await transport.send(request)
+        } catch let error as RedirectRefused {
+            // Scrubbed for the same reason a server's message is: the destination is a string
+            // the *server* chose, and it lands in an error a human reads on the machine the
+            // credential lives on.
+            throw SteleError.redirected(
+                host: host, destination: Redaction.scrub(error.destination)
+            )
         } catch let error as TransportError {
             // Scrubbed like a server's message, and for a stronger reason: `SteleTransport` is a
             // public protocol, so this string can come from a conformer written outside this

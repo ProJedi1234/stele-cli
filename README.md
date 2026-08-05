@@ -135,7 +135,7 @@ credential the user did not write, and it turns "where is my credential?" into a
 invisible answer. The file is where the user's account says it is, and nothing in the environment
 moves it.
 
-Three rules make the custody boundary real:
+Four rules make the custody boundary real:
 
 - **The token is never an argument.** `auth login` reads it from a TTY, because argv is visible
   in `ps` and lands in shell history — and shell history is something an agent reads. There is
@@ -145,6 +145,12 @@ Three rules make the custody boundary real:
 - **Loose permissions are refused.** A group- or world-readable credential file is an error, the
   way `ssh` treats a private key, not a warning to proceed past — and the check runs on every
   load, not only at login, because a `chmod` afterwards is exactly the accident it is here for.
+- **The token only ever goes to the host it was filed under.** Not just in how the URL is built:
+  `URLSession` follows redirects by itself and copies the `Authorization` header onto the
+  redirected request, so a server that can answer for the configured host could collect the
+  credential by replying `302 Location: http://somewhere-else/` while the caller saw an ordinary
+  success. The transport installs a redirect policy that follows a 3xx only within the same
+  scheme, host and port, and reports anything else as a refusal instead of following it.
 - **No subcommand ever prints the token**, including `auth status`, including `--json`, and
   including error paths. A 401 says the credential was rejected, not which credential. This is
   enforced by access control rather than by care: `Token`'s plaintext accessors are `internal`
@@ -221,6 +227,11 @@ parameter — the home directory into `CredentialStore`, the transport into `Ste
 suite covers the credential file's permissions and host resolution, the request each command
 builds, the status-code vocabulary, and the promise the whole project rests on: that no
 rendering of a credential, and no case of any error type, can be made to print a token.
+
+The one exception is the redirect policy, which is a decision `URLSession` makes rather than one
+this code makes — a fake transport would test the seam and not the thing. So those tests stand up
+two real HTTP servers on loopback ports and assert that the one the credential was *not* filed
+under never sees a byte of it, while a redirect within a single origin is still followed.
 
 ### The integration smoke test
 

@@ -39,6 +39,11 @@ public enum SteleError: Error, Equatable, CustomStringConvertible {
     case unexpectedStatus(code: Int, detail: String?)
     /// The request never got an answer: DNS, connection refused, TLS, timeout.
     case transportFailure(host: SteleHost, reason: String)
+    /// The host answered with a redirect to a different origin, and the client declined to
+    /// carry the credential there. Distinct from `transportFailure`, whose message promises the
+    /// credential was never sent — here it was sent, to the right host, which then pointed
+    /// somewhere else.
+    case redirected(host: SteleHost, destination: String)
     /// A 2xx whose body was not what this client expects — a proxy's landing page, a server
     /// too new or too old to share a shape.
     case malformedResponse(String)
@@ -103,6 +108,14 @@ public enum SteleError: Error, Equatable, CustomStringConvertible {
             return """
                 could not reach \(host): \(reason). Check that the host is right and that the \
                 server is up — the credential was never sent.
+                """
+        case .redirected(let host, let destination):
+            return """
+                \(host) answered with a redirect to \(destination), and stele does not follow a \
+                redirect to another host — the credential would travel with it. Nothing was \
+                sent there. Do not retry. If the deployment has really moved, ask the user to \
+                run `stele auth login --host <its new URL>`; if it has not, something is \
+                answering for \(host) that should not be.
                 """
         case .malformedResponse(let reason):
             return """

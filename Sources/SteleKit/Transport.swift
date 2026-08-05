@@ -79,6 +79,23 @@ public struct TransportError: Error, Sendable, Equatable {
     }
 }
 
+/// A server answered with a redirect to somewhere other than the origin that was addressed, and
+/// the transport declined to follow it.
+///
+/// Its own type rather than a `TransportError`, because the two are opposite reports: a
+/// `TransportError` means nothing was sent and the request can be retried once the host is
+/// reachable, while this means the request *was* answered — by the right host — and the answer
+/// was an instruction to hand the credential to a different one. The advice is not "check the
+/// server is up", it is "do not go there".
+public struct RedirectRefused: Error, Sendable, Equatable {
+    /// Where the server pointed, as it wrote it. Scrubbed before it reaches a message.
+    public let destination: String
+
+    public init(destination: String) {
+        self.destination = destination
+    }
+}
+
 /// How requests get sent. The seam that lets `SteleClient` be tested without a network, in the
 /// same spirit as the server's `PageStoring`.
 public protocol SteleTransport: Sendable {
@@ -100,10 +117,70 @@ public struct URLSessionTransport: SteleTransport {
         let session: URLSession
     }
 
+    /// One session for the process, built here rather than accepted as a parameter.
+    ///
+    /// Both halves of that matter. `URLSession` follows 3xx by itself and copies the request's
+    /// headers — `Authorization` among them — onto the redirected request, so a session without
+    /// the policy below turns any server that can answer for the configured host into a way to
+    /// collect this deployment's credential: it replies `302 Location: http://elsewhere/`, the
+    /// token is delivered there, and the caller sees an ordinary success. That is precisely what
+    /// `SteleClient` documents cannot happen, and until this delegate existed it was only true
+    /// of how URLs were *built*, not of what went out on the wire. A `session:` parameter would
+    /// have been a way to pass a session without the policy, which is why there is no longer one.
+    ///
+    /// Shared because `URLSession` retains its delegate until it is invalidated and a client is
+    /// constructed per command; ephemeral because a response authenticated with a bearer token
+    /// has no business in an on-disk URL cache.
+    private static let shared = SessionBox(
+        session: URLSession(
+            configuration: .ephemeral, delegate: RedirectPolicy(), delegateQueue: nil
+        )
+    )
+
     private let box: SessionBox
 
-    public init(session: URLSession = .shared) {
-        self.box = SessionBox(session: session)
+    public init() {
+        self.box = Self.shared
+    }
+
+    /// Declines any redirect that leaves the origin the caller addressed.
+    ///
+    /// Same-origin redirects are still followed: the header travelling with those goes to the
+    /// deployment it was filed under, which is the whole invariant. Everything else stops, and
+    /// the task completes with the 3xx itself — `send` turns that into a `RedirectRefused`.
+    /// Cancelling the task instead would arrive as a generic "cancelled" and read like the
+    /// user's own doing.
+    private final class RedirectPolicy: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            guard let origin = task.originalRequest?.url, let destination = request.url,
+                  sameOrigin(origin, destination)
+            else {
+                completionHandler(nil)
+                return
+            }
+            completionHandler(request)
+        }
+
+        /// Scheme, host and port, with the default port made explicit so `https://h` and
+        /// `https://h:443` are one origin — the same rule `SteleHost` normalises by, applied
+        /// here to a `URL` the server chose rather than to a string the user typed.
+        private func sameOrigin(_ lhs: URL, _ rhs: URL) -> Bool {
+            func origin(_ url: URL) -> String? {
+                guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased()
+                else { return nil }
+                let port = url.port ?? (scheme == "https" ? 443 : scheme == "http" ? 80 : -1)
+                return "\(scheme)://\(host):\(port)"
+            }
+            // A URL either side cannot be reduced to an origin is not one to carry a token to.
+            guard let lhs = origin(lhs), let rhs = origin(rhs) else { return false }
+            return lhs == rhs
+        }
     }
 
     public func send(_ request: SteleRequest) async throws -> SteleResponse {
@@ -125,16 +202,45 @@ public struct URLSessionTransport: SteleTransport {
                     continuation.resume(throwing: TransportError(reason: Self.reason(for: error)))
                     return
                 }
-                guard let status = (response as? HTTPURLResponse)?.statusCode else {
+                guard let http = response as? HTTPURLResponse else {
                     continuation.resume(
                         throwing: TransportError(reason: "the reply carried no HTTP status")
                     )
                     return
                 }
-                continuation.resume(returning: SteleResponse(status: status, body: data ?? Data()))
+                // A 3xx can only get this far by having been refused above — the policy follows
+                // same-origin redirects, and this client sends no conditional requests for a
+                // `304` to answer. Reported as the refusal it is rather than handed to the
+                // status table, which would call it "no advice for 302" and lose the one fact
+                // worth telling the operator.
+                guard !(300..<400).contains(http.statusCode) else {
+                    continuation.resume(
+                        throwing: RedirectRefused(
+                            destination: Self.location(of: http) ?? "an unnamed host"
+                        )
+                    )
+                    return
+                }
+                continuation.resume(
+                    returning: SteleResponse(status: http.statusCode, body: data ?? Data())
+                )
             }
             task.resume()
         }
+    }
+
+    /// The `Location` header, read out of the response *inside* the completion handler so a
+    /// `String` and not an `HTTPURLResponse` crosses the continuation.
+    ///
+    /// Walks `allHeaderFields` rather than calling `value(forHTTPHeaderField:)`, which is a
+    /// newer addition on swift-corelibs-foundation than this has to build against, and matches
+    /// the name case-insensitively because a header name is.
+    static func location(of response: HTTPURLResponse) -> String? {
+        for (name, value) in response.allHeaderFields
+        where (name as? String)?.lowercased() == "location" {
+            return value as? String
+        }
+        return nil
     }
 
     /// A failure reason a human can act on.

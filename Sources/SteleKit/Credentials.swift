@@ -30,7 +30,9 @@ public struct SteleHost: Sendable, Hashable, Comparable, CustomStringConvertible
     /// likely way to land here is a human pasting the token at `login`'s host prompt — one line
     /// above the token prompt, on the machine the credential is for. Echoing it back would put a
     /// live credential on the terminal, in the scrollback and in whatever transcript is running,
-    /// which is the exact accident this tool exists to prevent.
+    /// which is the exact accident this tool exists to prevent. `scrubbedEcho` rather than
+    /// `scrub`, because the token that gets pasted here is as likely to be the server's shared
+    /// upload token, which carries no prefix for `scrub` to recognise.
     public init(_ raw: String) throws(CredentialsError) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let components = URLComponents(string: trimmed),
@@ -38,7 +40,7 @@ public struct SteleHost: Sendable, Hashable, Comparable, CustomStringConvertible
               scheme == "http" || scheme == "https",
               let host = components.host?.lowercased(),
               !host.isEmpty
-        else { throw .invalidHost(Redaction.scrub(raw)) }
+        else { throw .invalidHost(Redaction.scrubbedEcho(raw)) }
 
         var canonical = "\(scheme)://\(host)"
         // Only a non-default port survives. `https://h:443` and `https://h` are one deployment
@@ -289,11 +291,26 @@ public struct CredentialStore: Sendable {
         let manager = FileManager.default
         guard manager.fileExists(atPath: path) else { return Credentials() }
 
+        // Resolved before it is stat'ed, and named in the message that follows.
+        // `attributesOfItem` does not follow symlinks, so it reports the *link's* own mode — and
+        // a symlink is `0777` by construction. A credentials file symlinked out of a dotfiles
+        // repository, which is an ordinary way to keep one, would therefore be refused forever:
+        // the printed remedy is `chmod 600 <path>`, `chmod` follows the link and changes the
+        // target, the link stays `0777`, and the advice loops. The mode that matters is the real
+        // file's, and so is the path to put in front of the user.
+        //
+        // Only when the last component is actually a link. Intermediate ones need no help —
+        // `stat` walks those itself — and resolving unconditionally would rewrite every path in
+        // every message on a platform where a parent happens to be symlinked (`/tmp` on macOS),
+        // which would make the messages harder to match against what the user typed.
+        let isSymbolicLink = (try? manager.destinationOfSymbolicLink(atPath: path)) != nil
+        let resolved = isSymbolicLink ? (path as NSString).resolvingSymlinksInPath : path
+
         let attributes: [FileAttributeKey: Any]
         do {
-            attributes = try manager.attributesOfItem(atPath: path)
+            attributes = try manager.attributesOfItem(atPath: resolved)
         } catch {
-            throw .unreadable(path: path, reason: error.localizedDescription)
+            throw .unreadable(path: resolved, reason: error.localizedDescription)
         }
 
         // The permission check happens before the bytes are read, so a world-readable file is
@@ -304,7 +321,7 @@ public struct CredentialStore: Sendable {
             // Any group or other bit, not just read. A file another user can *write* is worse
             // than one they can read — they choose the token, and the CLI presents it.
             if mode & 0o077 != 0 {
-                throw .fileTooOpen(path: path, mode: mode)
+                throw .fileTooOpen(path: resolved, mode: mode)
             }
         }
 
@@ -409,6 +426,11 @@ public struct CredentialStore: Sendable {
         }
 
         var entries: [SteleHost: Credentials.Entry] = [:]
+        /// Which key each host came from, so a second key naming the same deployment can be
+        /// reported against the first. `[String: Any]` has no order, so without this the file
+        /// would resolve to whichever spelling the iteration happened to reach last — a
+        /// credential that can differ between two runs over identical bytes.
+        var keysByHost: [SteleHost: String] = [:]
         var defaultRaw: String?
 
         for (key, value) in object {
@@ -428,11 +450,23 @@ public struct CredentialStore: Sendable {
                 throw malformed("the entry for '\(key)' has no 'client' and 'token'")
             }
             guard let host = try? SteleHost(key) else {
-                throw malformed("'\(key)' is not a host URL")
+                throw malformed("'\(Redaction.scrubbedEcho(key))' is not a host URL")
+            }
+            // Two spellings of one deployment — `https://h` and `https://h:443`, or two casings
+            // — normalise onto the same key, and the file gives no way to say which credential
+            // is meant. Refused rather than resolved arbitrarily: this file is documented as
+            // something a human edits, and "which token gets used" is not a question to answer
+            // by dictionary order.
+            if let existing = keysByHost[host] {
+                throw malformed("""
+                    '\(Redaction.scrubbedEcho(key))' and '\(Redaction.scrubbedEcho(existing))' \
+                    are both \(host), and nothing says which credential wins — keep one of them
+                    """)
             }
             guard let token = try? Token(token) else {
-                throw malformed("the token for '\(key)' is not a usable token")
+                throw malformed("the token for '\(Redaction.scrubbedEcho(key))' is not a usable token")
             }
+            keysByHost[host] = key
             entries[host] = Credentials.Entry(clientName: client, token: token)
         }
 

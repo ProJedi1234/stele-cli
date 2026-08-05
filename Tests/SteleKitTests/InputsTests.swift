@@ -67,6 +67,47 @@ struct InputsTests {
         #expect(throws: ExpiryDuration.ParseError.self) { try ExpiryDuration.seconds(from: raw) }
     }
 
+    /// The ceiling exists to keep a bad argument an *error*. Without it these multiply out past
+    /// `Int`'s range, and the conversion the request body needs is a Swift runtime trap — the
+    /// user gets a crash and a backtrace where every other bad duration gets a sentence.
+    @Test(
+        "a lifetime past the ceiling is refused rather than trapped",
+        arguments: [
+            "999999999999999d",           // overflows the multiply
+            "99999999999999999999999d",   // too many digits for Int at all
+            "3651d",                      // one day past the ceiling
+            "9999w",
+        ]
+    )
+    func refusesAbsurdDurations(_ raw: String) {
+        #expect(throws: ExpiryDuration.ParseError.tooLong(raw)) {
+            try ExpiryDuration.seconds(from: raw)
+        }
+    }
+
+    @Test("the ceiling itself is accepted, and says what it is")
+    func acceptsTheCeiling() throws {
+        let maximum = ExpiryDuration.maximumSeconds
+        #expect(try ExpiryDuration.seconds(from: "\(maximum / 86400)d") == TimeInterval(maximum))
+        #expect(ExpiryDuration.ParseError.tooLong("9999w").description.contains("\(maximum / 86400)d"))
+    }
+
+    /// Not the CLI's path — `ExpiryDuration` bounds that — but `createClient` takes a
+    /// `TimeInterval` from any caller of the library, and `Int(someDouble)` out of range traps.
+    @Test(
+        "an unbounded lifetime reaching the client is clamped rather than trapped",
+        arguments: [Double.infinity, -.infinity, .nan, 1e30, -1e30, .greatestFiniteMagnitude]
+    )
+    func clampsRatherThanTraps(_ interval: TimeInterval) {
+        _ = SteleClient.wholeSeconds(interval)
+    }
+
+    @Test("an ordinary lifetime survives the clamp unchanged")
+    func clampLeavesOrdinaryValuesAlone() {
+        #expect(SteleClient.wholeSeconds(7_776_000) == 7_776_000)
+        #expect(SteleClient.wholeSeconds(90.4) == 90)
+    }
+
     @Test("a zero lifetime is refused as its own case, because the fix is different")
     func rejectsZero() {
         #expect(throws: ExpiryDuration.ParseError.notPositive("0d")) {

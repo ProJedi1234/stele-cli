@@ -199,6 +199,7 @@ private func caseName(of error: SteleError) -> String {
     case .slugAllocationFailed: return "slugAllocationFailed"
     case .unexpectedStatus: return "unexpectedStatus"
     case .transportFailure: return "transportFailure"
+    case .redirected: return "redirected"
     case .malformedResponse: return "malformedResponse"
     }
 }
@@ -206,7 +207,7 @@ private func caseName(of error: SteleError) -> String {
 private let everySteleErrorCase: Set<String> = [
     "badRequest", "unauthorized", "forbidden", "notFound", "slugTaken", "pageTooLarge",
     "unsupportedContentType", "upgradeRequired", "slugAllocationFailed", "unexpectedStatus",
-    "transportFailure", "malformedResponse",
+    "transportFailure", "redirected", "malformedResponse",
 ]
 
 private func caseName(of error: CredentialsError) -> String {
@@ -229,13 +230,16 @@ private let everyCredentialsErrorCase: Set<String> = [
     "malformedToken", "notAuthenticated", "noCredentialForHost", "ambiguousHost",
 ]
 
-/// Replies with one fixed answer, or refuses to reach a server at all.
+/// Replies with one fixed answer, refuses to reach a server at all, or reports a redirect it
+/// declined to follow.
 private struct StubTransport: SteleTransport {
     var status = 200
     var body = Data()
     var failure: TransportError?
+    var redirect: RedirectRefused?
 
     func send(_ request: SteleRequest) async throws -> SteleResponse {
+        if let redirect { throw redirect }
         if let failure { throw failure }
         return SteleResponse(status: status, body: body)
     }
@@ -281,6 +285,20 @@ struct ErrorLeakTests {
                 await Self.attempt(
                     transport: StubTransport(
                         failure: TransportError(reason: "refused while presenting \(echoedSecret)")
+                    )
+                ) as? SteleError
+            )
+        )
+        // A server pointing somewhere else, with a credential in the URL it pointed at. The
+        // destination is a string the *server* chose, so it takes the same route into the
+        // message as any other thing a server said.
+        produced.append(
+            try #require(
+                await Self.attempt(
+                    transport: StubTransport(
+                        redirect: RedirectRefused(
+                            destination: "https://elsewhere.example.invalid/?t=\(echoedSecret)"
+                        )
                     )
                 ) as? SteleError
             )
@@ -394,6 +412,33 @@ struct ErrorLeakTests {
             expectNoLeak(error, "CredentialsError.\(caseName(of: error))")
             expectNoLeak(error.description, "the description of CredentialsError.\(caseName(of: error))")
         }
+    }
+
+    /// The credential a search for `stele_pat_` cannot find.
+    ///
+    /// `Token.init` accepts an unprefixed token deliberately: until the server's shared
+    /// `STELE_UPLOAD_TOKEN` is demoted to an admin-only credential, whatever that variable was
+    /// set to *is* what an operator logs in with, and it is what the integration smoke script
+    /// feeds in. Every other canary in this file carries the prefix — which is exactly how a
+    /// redaction that recognises only the prefix passes a suite this size while leaking the one
+    /// credential most likely to be pasted at the wrong prompt.
+    @Test("a token with no stele_pat_ prefix is withheld too")
+    func unprefixedTokenIsNeverEchoed() throws {
+        let legacy = "kf83Hd9sLxQ2vB7nT4wR6yZ0mP1cJ5aE"
+        let error = try #require(collect { _ = try SteleHost(legacy) })
+        #expect(!error.description.contains(legacy))
+        #expect(error.description.contains(Token.redaction))
+    }
+
+    /// And the other half, which is the reason the rule is a shape test rather than "never echo
+    /// anything": a message that withholds the typo cannot be acted on.
+    @Test(
+        "an ordinary mistyped host is still quoted back",
+        arguments: ["stele.example.com", "https//stele.example.com", "ftp://stele.example.com"]
+    )
+    func mistypedHostIsStillEchoed(_ typo: String) throws {
+        let error = try #require(collect { _ = try SteleHost(typo) })
+        #expect(error.description.contains(typo))
     }
 
     /// Runs a throwing expression for its error. `#expect(throws:)` asserts the type; this hands

@@ -114,6 +114,56 @@ struct CredentialFileTests {
         #expect(throws: CredentialsError.self) { try store.load() }
     }
 
+    /// Symlinking the credential file out of a dotfiles repository is an ordinary thing to do,
+    /// and `attributesOfItem` does not follow symlinks — it reports the *link's* mode, which is
+    /// `0777` by construction. So the check refused the file every time, and the remedy it
+    /// printed could not fix it: `chmod` follows the link and changes the target, which was
+    /// already `0600`, leaving the link at `0777` and the advice in a loop.
+    @Test("a symlinked credential file is judged by the real file's mode")
+    func followsSymlinkForThePermissionCheck() throws {
+        let home = try FakeHome()
+        let store = home.store
+        var credentials = Credentials()
+        credentials.set(try credential("https://stele.example.com"))
+        try store.save(credentials)
+
+        // The real file moves aside, the credential path becomes a link to it — the shape a
+        // dotfiles manager leaves behind.
+        let real = (home.path as NSString).appendingPathComponent("credentials.json")
+        try FileManager.default.moveItem(atPath: store.path, toPath: real)
+        try FileManager.default.createSymbolicLink(
+            atPath: store.path, withDestinationPath: real
+        )
+        #expect(try home.mode(of: store.path) == 0o777)
+
+        #expect(try store.load().hosts == [try SteleHost("https://stele.example.com")])
+    }
+
+    /// And the rule still bites through a link: what is checked is the real file, not the fact
+    /// that a link was involved.
+    @Test("a symlink to a loose file is still refused, naming the file to chmod")
+    func refusesLooseTargetThroughSymlink() throws {
+        let home = try FakeHome()
+        let store = home.store
+        var credentials = Credentials()
+        credentials.set(try credential("https://stele.example.com"))
+        try store.save(credentials)
+
+        let real = (home.path as NSString).appendingPathComponent("credentials.json")
+        try FileManager.default.moveItem(atPath: store.path, toPath: real)
+        try FileManager.default.createSymbolicLink(atPath: store.path, withDestinationPath: real)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: real)
+
+        let thrown = #expect(throws: CredentialsError.self) { try store.load() }
+        guard case .fileTooOpen(let path, let mode) = try #require(thrown) else {
+            Issue.record("expected fileTooOpen, got \(String(describing: thrown))")
+            return
+        }
+        #expect(mode == 0o644)
+        // The path a `chmod` has to be pointed at is the target, not the link.
+        #expect(path == (real as NSString).resolvingSymlinksInPath)
+    }
+
     /// A fresh machine is not an error state; `resolve` produces the message worth reading.
     @Test("an absent file loads as empty credentials")
     func absentFileIsEmpty() throws {
@@ -256,5 +306,54 @@ struct SteleHostTests {
     @Test("a host without a scheme is refused", arguments: ["stele.example.com", "", "ftp://x", "https://"])
     func requiresAScheme(_ raw: String) {
         #expect(throws: CredentialsError.self) { try SteleHost(raw) }
+    }
+
+    /// The other side of the normalisation rule. Two spellings of one deployment are one key,
+    /// and `[String: Any]` has no order — so a file holding both used to resolve to whichever
+    /// the dictionary iteration happened to reach last, which is a credential that can differ
+    /// between two runs over identical bytes. The file is documented as something a human
+    /// edits, so this is reachable, and "which token gets used" is not a question to answer by
+    /// iteration order.
+    @Test(
+        "two keys naming one deployment are refused rather than resolved arbitrarily",
+        arguments: [
+            ("https://stele.example.com", "https://stele.example.com:443"),
+            ("https://stele.example.com", "https://Stele.Example.com"),
+            ("http://stele.example.com", "http://stele.example.com/"),
+        ]
+    )
+    func refusesCollidingKeys(_ first: String, _ second: String) throws {
+        let data = Data(
+            #"""
+            {"\#(first)": {"client": "one", "token": "stele_pat_one"},
+             "\#(second)": {"client": "two", "token": "stele_pat_two"}}
+            """#.utf8
+        )
+        let thrown = #expect(throws: CredentialsError.self) {
+            try CredentialStore.decode(data, path: "credentials.json")
+        }
+        guard case .malformed(_, let reason) = try #require(thrown) else {
+            Issue.record("expected malformed, got \(String(describing: thrown))")
+            return
+        }
+        // Both spellings, so the person editing the file knows which two lines to look at.
+        #expect(reason.contains(first))
+        #expect(reason.contains(second))
+    }
+
+    /// Two genuinely different deployments still load, which is the case the check must not
+    /// catch.
+    @Test("two distinct hosts are not a collision")
+    func distinctHostsLoad() throws {
+        let loaded = try CredentialStore.decode(
+            Data(
+                #"""
+                {"https://one.example.com": {"client": "one", "token": "stele_pat_one"},
+                 "https://one.example.com:8443": {"client": "two", "token": "stele_pat_two"}}
+                """#.utf8
+            ),
+            path: "credentials.json"
+        )
+        #expect(loaded.hosts.count == 2)
     }
 }

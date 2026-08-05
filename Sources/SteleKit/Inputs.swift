@@ -46,8 +46,9 @@ public enum ContentType {
 /// whoever reads the code, and the failure mode of guessing wrong is a credential that expires
 /// a minute and a half after it is minted — or one that outlives the machine it was for.
 public enum ExpiryDuration {
-    /// Seconds per unit, in the order a message should list them.
-    static let units: [(suffix: String, seconds: Double, name: String)] = [
+    /// Seconds per unit, in the order a message should list them. Whole seconds as `Int`, so the
+    /// arithmetic below can be checked for overflow — `Double` would silently round instead.
+    static let units: [(suffix: String, seconds: Int, name: String)] = [
         ("s", 1, "seconds"),
         ("m", 60, "minutes"),
         ("h", 3600, "hours"),
@@ -55,9 +56,25 @@ public enum ExpiryDuration {
         ("w", 604_800, "weeks"),
     ]
 
+    /// The longest lifetime this will parse.
+    ///
+    /// A ceiling has to exist, and not for tidiness: without one, `999999999999999d` multiplies
+    /// out to about 8.6e19 seconds, and turning that into the `Int` the request body carries is
+    /// a Swift *runtime trap* rather than an error. The user gets a crash and a backtrace where
+    /// every other bad duration gets a sentence telling them what to type instead.
+    ///
+    /// Ten years is far past any credential's useful life — a credential that outlives the
+    /// machine it was minted for is the thing `--expires-in` exists to prevent — and far short
+    /// of where the arithmetic gets interesting.
+    public static let maximumSeconds = 3650 * 86400
+
     public enum ParseError: Error, Equatable, CustomStringConvertible {
         case malformed(String)
         case notPositive(String)
+        /// A well-formed duration that is longer than `maximumSeconds`, including one whose
+        /// digits do not fit in an `Int` at all. Its own case because the correction is
+        /// different: the syntax was right and the number was not.
+        case tooLong(String)
 
         public var description: String {
             let vocabulary = ExpiryDuration.units
@@ -75,6 +92,13 @@ public enum ExpiryDuration {
                     '\(raw)' is not a lifetime. A credential that expires now or in the past \
                     would be minted dead; omit --expires-in for one that never expires.
                     """
+            case .tooLong(let raw):
+                return """
+                    '\(raw)' is longer than the longest lifetime stele will ask for \
+                    (\(ExpiryDuration.maximumSeconds / 86400)d). Give a shorter one, or omit \
+                    --expires-in for a credential that never expires — which is what a lifetime \
+                    that long means anyway.
+                    """
             }
         }
     }
@@ -85,11 +109,18 @@ public enum ExpiryDuration {
         guard let suffix = text.last, let unit = units.first(where: { $0.suffix == String(suffix) })
         else { throw .malformed(raw) }
 
+        // ASCII digits specifically. `isNumber` also admits other scripts' digits, which `Int`
+        // then declines to parse — and the check below reads a failed parse as overflow.
         let digits = text.dropLast()
-        guard !digits.isEmpty, digits.allSatisfy(\.isNumber), let count = Int(digits) else {
+        guard !digits.isEmpty, digits.allSatisfy({ $0.isASCII && $0.isNumber }) else {
             throw .malformed(raw)
         }
+        // So a digit run too long for `Int` lands on `.tooLong` rather than `.malformed`, which
+        // would tell the user to write a number and a unit — which is exactly what they did.
+        guard let count = Int(digits) else { throw .tooLong(raw) }
         guard count > 0 else { throw .notPositive(raw) }
-        return TimeInterval(count) * unit.seconds
+        let (total, overflowed) = count.multipliedReportingOverflow(by: unit.seconds)
+        guard !overflowed, total <= maximumSeconds else { throw .tooLong(raw) }
+        return TimeInterval(total)
     }
 }

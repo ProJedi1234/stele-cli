@@ -140,6 +140,11 @@ extension MintedToken: CustomReflectable {
 /// alternative is a claim about *another repository's* behaviour holding this library's core
 /// promise up, and that promise should not depend on a remote deployment's error strings.
 enum Redaction {
+    /// The shortest run of credential-shaped characters `scrubbedEcho` will withhold. Well under
+    /// the 53 characters the server mints (`stele_pat_` plus base64url of 32 bytes) and under any
+    /// shared secret worth the name, and above the length of a host label anyone types by hand.
+    static let secretLikeLength = 20
+
     static func scrub(_ text: String) -> String {
         guard text.contains(Token.mintedPrefix) else { return text }
 
@@ -159,5 +164,37 @@ enum Redaction {
             remainder = tail
         }
         return result + remainder
+    }
+
+    /// A value a *human typed* — a host at a prompt, a key in the credential file — prepared for
+    /// echoing back inside an error.
+    ///
+    /// `scrub` recognises a credential by the server's `stele_pat_` prefix, and the credential
+    /// most likely to be pasted at the wrong prompt is exactly the one that does not carry it:
+    /// `Token.init` deliberately accepts an unprefixed token, because until the server's shared
+    /// `STELE_UPLOAD_TOKEN` is demoted to an admin-only credential, whatever that variable was
+    /// set to *is* what an operator logs in with. So the one accident this redaction exists for —
+    /// a token pasted one line above the token prompt, on the machine the credential is for —
+    /// went through `scrub` untouched and was printed to the terminal verbatim.
+    ///
+    /// The additional rule is deliberately confined to this entry point and kept out of `scrub`,
+    /// which also runs over servers' messages: withhold the value if the whole of it is one
+    /// unbroken run of credential characters and long enough to be a credential. A host is not
+    /// that — it carries a scheme, or a dot, or both — so the only thing this can cost is the
+    /// echo of an unusually long single-label hostname, and what it buys is that no credential is
+    /// printed regardless of how it was spelled.
+    static func scrubbedEcho(_ raw: String) -> String {
+        let text = scrub(raw)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= secretLikeLength, trimmed.allSatisfy(isCredentialCharacter)
+        else { return text }
+        return Token.redaction
+    }
+
+    /// base64url plus the underscore the prefix uses — the alphabet a stele credential is drawn
+    /// from, and one that contains none of the punctuation a URL or a sentence needs.
+    private static func isCredentialCharacter(_ character: Character) -> Bool {
+        guard character.isASCII else { return false }
+        return character.isLetter || character.isNumber || character == "-" || character == "_"
     }
 }
