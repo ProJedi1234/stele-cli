@@ -124,3 +124,135 @@ public enum ExpiryDuration {
         return TimeInterval(total)
     }
 }
+
+/// How long a published page lives, as the `?ttl=` value `POST /pages` wants.
+///
+/// The server measures a page's life in whole days or not at all: `?ttl=30`, or `?ttl=never`.
+/// Omitting it is a third thing — the server's own default, seven days — and that default is
+/// deliberately not repeated here. A CLI that printed "expires in 7 days" from a constant would
+/// keep printing it the day the server changed its mind, and the server tells us the real answer
+/// in the response body anyway.
+///
+/// Note what this type does *not* do: it has no maximum. The server's `PageLifetime` owns that
+/// bound, for the same reason its `Slug` owns the slug rules — a copy here would be a second
+/// source of truth that drifts silently the first time the server moves it. An over-long
+/// lifetime comes back as a `400` naming the real limit. What is checked here is only what the
+/// server cannot check for us: that the caller wrote something that means a number of days at
+/// all, and that turning it into one does not overflow on the way.
+public enum PageTTL: Sendable, Equatable {
+    case days(Int)
+    case never
+
+    /// The query parameter, and the spelling that opts out of expiry. Both are the server's
+    /// words, and both are exact-match contracts with another repository — the same class of
+    /// constant as `SteleClient.Path` and `expiresIn`, and the same failure if they drift: a
+    /// `ttl=forever` would be a `400`, but a parameter named anything but `ttl` would be
+    /// *ignored*, and a page the caller asked to keep forever would quietly die in a week.
+    public static let queryParameter = "ttl"
+    public static let neverKeyword = "never"
+
+    /// Days and weeks, which are the units that survive the trip.
+    ///
+    /// Nothing shorter is offered, and that is the whole reason this is not `ExpiryDuration`.
+    /// The server stores a page's deadline to the day, so `12h` could only be honoured by
+    /// rounding it to something the caller did not type — and a lifetime silently rounded is
+    /// the failure both ends of this contract are built to refuse.
+    static let units: [(suffix: String, days: Int, name: String)] = [
+        ("d", 1, "days"),
+        ("w", 7, "weeks"),
+    ]
+
+    public enum ParseError: Error, Equatable, CustomStringConvertible {
+        case malformed(String)
+        case notPositive(String)
+        /// A unit this server cannot store a page to: hours, minutes, seconds. Its own case
+        /// because the caller wrote a perfectly good duration and the answer is not "write a
+        /// duration" but "days are the resolution you get".
+        case tooFine(String, unit: String)
+        /// A number of days too large to be turned into one at all. Not a policy limit — the
+        /// server's is enforced by the server — but the point past which the arithmetic here
+        /// stops being arithmetic.
+        case unreachable(String)
+
+        public var description: String {
+            switch self {
+            case .malformed(let raw):
+                return """
+                    '\(raw)' is not a page lifetime. Write a whole number of days — 30, or 30d — \
+                    or '\(PageTTL.neverKeyword)' for a page that is kept until you delete it.
+                    """
+            case .notPositive(let raw):
+                return """
+                    '\(raw)' is not a lifetime. A page that expires now or in the past would be \
+                    published dead; use '\(PageTTL.neverKeyword)' for one that is kept.
+                    """
+            case .tooFine(let raw, let unit):
+                return """
+                    '\(raw)' is \(unit), and a page's lifetime is measured in whole days — \
+                    honouring it would mean rounding to a lifetime you did not ask for. Write \
+                    the number of days instead, or '\(PageTTL.neverKeyword)' to keep the page.
+                    """
+            case .unreachable(let raw):
+                return """
+                    '\(raw)' is too many days to be a lifetime. Use \
+                    '\(PageTTL.neverKeyword)' for a page that should never expire.
+                    """
+            }
+        }
+    }
+
+    /// `"30"` and `"30d"` → `.days(30)`; `"2w"` → `.days(14)`; `"never"` → `.never`.
+    ///
+    /// A bare number is accepted here where `--expires-in` refuses one, and the difference is
+    /// not an inconsistency. That flag's underlying unit is *seconds* and its range runs from
+    /// seconds to weeks, so `90` genuinely has two readings and guessing between them mints a
+    /// credential that dies in a minute and a half. A page's lifetime has one unit, the server's
+    /// own document teaches `?ttl=30`, and refusing the spelling an agent just read there would
+    /// be a second grammar to no purpose.
+    public static func parse(_ raw: String) throws(ParseError) -> PageTTL {
+        let text = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !text.isEmpty else { throw .malformed(raw) }
+        if text == neverKeyword { return .never }
+
+        // A trailing unit is optional; its absence means days. Anything that is not a digit run
+        // has to be named as a unit before it can be refused as one, so hours and friends are
+        // matched here rather than falling through to "that is not a lifetime".
+        let (digits, multiplier): (Substring, Int)
+        if let last = text.last, last.isASCII, !last.isNumber {
+            if let unit = units.first(where: { $0.suffix == String(last) }) {
+                (digits, multiplier) = (text.dropLast(), unit.days)
+            } else if let finer = ExpiryDuration.units.first(where: { $0.suffix == String(last) }) {
+                throw .tooFine(raw, unit: finer.name)
+            } else {
+                throw .malformed(raw)
+            }
+        } else {
+            (digits, multiplier) = (text[...], 1)
+        }
+
+        // ASCII digits specifically, matching `ExpiryDuration`: `isNumber` admits other scripts'
+        // digits, which `Int` then declines to parse, and the check below reads a failed parse
+        // as a number too large rather than a number in the wrong script.
+        guard !digits.isEmpty, digits.allSatisfy({ $0.isASCII && $0.isNumber }) else {
+            // A leading `-` lands here. It is not a malformed lifetime, it is a negative one,
+            // and saying so sends the caller to the right correction.
+            if digits.first == "-", digits.dropFirst().allSatisfy({ $0.isASCII && $0.isNumber }) {
+                throw .notPositive(raw)
+            }
+            throw .malformed(raw)
+        }
+        guard let count = Int(digits) else { throw .unreachable(raw) }
+        guard count > 0 else { throw .notPositive(raw) }
+        let (days, overflowed) = count.multipliedReportingOverflow(by: multiplier)
+        guard !overflowed else { throw .unreachable(raw) }
+        return .days(days)
+    }
+
+    /// What travels as `?ttl=`.
+    public var queryValue: String {
+        switch self {
+        case .days(let count): return String(count)
+        case .never: return PageTTL.neverKeyword
+        }
+    }
+}

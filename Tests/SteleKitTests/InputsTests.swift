@@ -125,3 +125,97 @@ struct InputsTests {
         }
     }
 }
+
+/// The other lifetime, which is a different grammar for a reason: a credential's is seconds and
+/// a page's is whole days, and the two flags are close enough together on the command line that
+/// where they diverge is worth pinning.
+@Suite("page lifetimes")
+struct PageTTLTests {
+    static let dayCases: [(String, Int)] = [
+        ("30", 30), ("30d", 30), ("1", 1), ("2w", 14), ("365d", 365),
+        // Trimmed and lowercased before anything looks at it, like its sibling.
+        (" 7D ", 7),
+    ]
+
+    @Test("a lifetime is a whole number of days, with or without a unit", arguments: dayCases)
+    func days(_ raw: String, _ expected: Int) throws {
+        #expect(try PageTTL.parse(raw) == .days(expected))
+    }
+
+    /// The bare number is the case worth stating outright, because it is exactly what
+    /// `--expires-in` refuses. A page's lifetime has one unit and the server's own document
+    /// teaches `?ttl=30`, so the spelling an agent just read there has to work.
+    @Test("a bare number means days, unlike --expires-in")
+    func bareNumberIsDays() throws {
+        #expect(try PageTTL.parse("30") == .days(30))
+        #expect(throws: ExpiryDuration.ParseError.malformed("30")) {
+            try ExpiryDuration.seconds(from: "30")
+        }
+    }
+
+    @Test("'never' is the only way to ask for a page that is kept")
+    func never() throws {
+        #expect(try PageTTL.parse(PageTTL.neverKeyword) == .never)
+        #expect(try PageTTL.parse("NEVER") == .never)
+        // Not a synonym. The server matches one keyword exactly, and a parser that quietly
+        // accepted a second spelling would send a `400` for a page the caller meant to keep.
+        #expect(throws: PageTTL.ParseError.malformed("forever")) { try PageTTL.parse("forever") }
+    }
+
+    /// The heart of why this is not `ExpiryDuration`. `12h` is a perfectly good duration that
+    /// this server cannot store, and the only ways to honour it are to round — silently giving
+    /// the caller a lifetime they did not type — or to say so.
+    @Test(
+        "a unit finer than a day is refused rather than rounded",
+        arguments: [("12h", "hours"), ("90m", "minutes"), ("3600s", "seconds")]
+    )
+    func refusesSubDayUnits(_ raw: String, _ unit: String) {
+        #expect(throws: PageTTL.ParseError.tooFine(raw, unit: unit)) { try PageTTL.parse(raw) }
+        // And the message says which unit it was, so the correction is arithmetic the caller
+        // can do rather than a guess at what the tool wanted.
+        #expect(PageTTL.ParseError.tooFine(raw, unit: unit).description.contains(unit))
+    }
+
+    @Test(
+        "anything that is not a number of days is refused",
+        arguments: ["", "  ", "7.5", "abc", "d", "w", "30x", "3 0", "٣٠", "-", "1e3"]
+    )
+    func refusesMalformed(_ raw: String) {
+        #expect(throws: PageTTL.ParseError.self) { try PageTTL.parse(raw) }
+    }
+
+    /// Zero and negative get their own case for the same reason `ExpiryDuration` gives them one:
+    /// the syntax was right and the correction is a different sentence.
+    @Test("a lifetime of zero or less is refused as its own case", arguments: ["0", "0d", "-5", "-5d"])
+    func refusesNonPositive(_ raw: String) {
+        #expect(throws: PageTTL.ParseError.notPositive(raw)) { try PageTTL.parse(raw) }
+    }
+
+    /// This type deliberately has no maximum — the server owns that bound. What it does have is
+    /// arithmetic, and the arithmetic must not trap: `Int(_:)` on a digit run too long, and the
+    /// weeks multiplication, are the two places a number can run off the end.
+    @Test(
+        "a number too large to become days is reported, not trapped",
+        arguments: ["999999999999999999999999", "9999999999999999999w", "\(Int.max)w"]
+    )
+    func refusesUnreachable(_ raw: String) {
+        #expect(throws: PageTTL.ParseError.unreachable(raw)) { try PageTTL.parse(raw) }
+    }
+
+    /// A lifetime past the *server's* maximum is not rejected here. A copy of that bound would
+    /// be a second source of truth that drifts the day the server moves it, and the `400` it
+    /// earns names the real limit — which a local guess could not.
+    @Test("a lifetime past the server's ceiling is left for the server to refuse")
+    func doesNotCopyTheServersCeiling() throws {
+        #expect(try PageTTL.parse("36501") == .days(36_501))
+        #expect(try PageTTL.parse("100000d") == .days(100_000))
+    }
+
+    @Test("what travels on the wire is the server's own spelling")
+    func queryValues() {
+        #expect(PageTTL.days(30).queryValue == "30")
+        #expect(PageTTL.days(14).queryValue == "14")
+        #expect(PageTTL.never.queryValue == "never")
+        #expect(PageTTL.queryParameter == "ttl")
+    }
+}

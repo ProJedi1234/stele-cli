@@ -87,6 +87,54 @@ struct SteleClientRequestTests {
         #expect(try #require(await transport.last).url.query == "slug=my-page")
     }
 
+    /// The silent failure this parameter is heir to. A `ttl` misspelled in the query is not a
+    /// `400` — the server has no reason to look at a parameter it does not know, so the upload
+    /// earns a cheerful `201` and the page the caller asked to keep quietly dies on the default
+    /// schedule. Read off the URL, because nothing downstream would notice.
+    @Test(
+        "a lifetime travels as ?ttl=, spelled the server's way",
+        arguments: [(PageTTL.days(30), "ttl=30"), (PageTTL.days(14), "ttl=14"), (.never, "ttl=never")]
+    )
+    func lifetimeQuery(_ ttl: PageTTL, _ expected: String) async throws {
+        let transport = FakeTransport(status: 201, body: #"{"slug":"a-b-c","url":"u","expires":null}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.publish(page: Data("x".utf8), ttl: ttl, using: credential)
+
+        #expect(try #require(await transport.last).url.query == expected)
+    }
+
+    /// `?ttl=` and `?slug=` are independent, and a page that asks for both must send both — the
+    /// query is built by appending, and an assignment where an append belonged would drop one.
+    @Test("a slug and a lifetime both travel")
+    func slugAndLifetime() async throws {
+        let transport = FakeTransport(status: 201, body: #"{"slug":"my-page","url":"u","expires":null}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.publish(
+            page: Data("x".utf8), slug: "my-page", ttl: .never, using: credential
+        )
+
+        let query = try #require(await transport.last).url.query
+        #expect(query == "slug=my-page&ttl=never")
+    }
+
+    /// No `--ttl` means no parameter at all, which is a third thing and not a synonym for
+    /// either value: absence is what asks for the server's default lifetime. `?ttl=` with
+    /// nothing after it is a `400`, and `?ttl=never` would keep a page nobody asked to keep.
+    @Test("publishing without a lifetime sends no ttl at all")
+    func noLifetime() async throws {
+        let transport = FakeTransport(status: 201, body: #"{"slug":"a-b-c","url":"u","expires":null}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.publish(page: Data("x".utf8), slug: "a-b-c", using: credential)
+
+        #expect(try #require(await transport.last).url.query == "slug=a-b-c")
+    }
+
     @Test("update puts to the slug's own path and sends no query")
     func update() async throws {
         let transport = FakeTransport(status: 200, body: #"{"slug":"my-page","url":"u"}"#)
@@ -98,6 +146,52 @@ struct SteleClientRequestTests {
         let request = try #require(await transport.last)
         #expect(request.method == "PUT")
         #expect(request.url.absoluteString == "https://stele.example.com/pages/my-page")
+    }
+
+    /// A slug is one path segment and must stay one, however it is spelled. Left raw it is not
+    /// only a `/` away from another route: RFC 3986 removes dot segments before the request is
+    /// ever sent, so `update ../admin/clients` reaches the server as `PUT /admin/clients` — an
+    /// admin route addressed by a page command. The token still travels only to its own host,
+    /// so this is not a leak; it is the request acting on a resource nobody named.
+    @Test(
+        "a slug cannot climb out of /pages",
+        arguments: [
+            ("../admin/clients", "https://stele.example.com/pages/..%2Fadmin%2Fclients"),
+            ("..", "https://stele.example.com/pages/%2E%2E"),
+            (".", "https://stele.example.com/pages/%2E"),
+            ("a/b", "https://stele.example.com/pages/a%2Fb"),
+            ("quiet-cedar-otter", "https://stele.example.com/pages/quiet-cedar-otter"),
+        ]
+    )
+    func slugStaysOneSegment(_ slug: String, _ expected: String) async throws {
+        let transport = FakeTransport(status: 200, body: #"{"slug":"x","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try? await client.update(slug: slug, page: Data("x".utf8), using: credential)
+
+        let request = try #require(await transport.last)
+        #expect(request.url.absoluteString == expected)
+        // The property the escapes above are only instances of: whatever was typed, the request
+        // is still for something under /pages.
+        #expect(request.url.standardized.path.hasPrefix("/pages/"))
+    }
+
+    /// The same rule on the admin side, where the reachable routes are the destructive ones.
+    @Test("a client name cannot climb out of /admin/clients")
+    func clientNameStaysOneSegment() async throws {
+        let transport = FakeTransport(status: 200, body: #"{"name":"x","scopes":[]}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try? await client.revokeClient(name: "../../pages/quiet-cedar-otter", using: credential)
+
+        let request = try #require(await transport.last)
+        #expect(
+            request.url.absoluteString
+                == "https://stele.example.com/admin/clients/..%2F..%2Fpages%2Fquiet-cedar-otter"
+        )
+        #expect(request.url.standardized.path.hasPrefix("/admin/clients/"))
     }
 
     /// The skill is a read, and reads on this server are unauthenticated — an agent
@@ -330,6 +424,71 @@ struct SteleClientRequestTests {
         let body = try #require(request.body)
         let sent = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
         #expect(sent["expiresIn"] == nil)
+    }
+}
+
+/// The other half of the lifetime contract: what comes back. The deadline is the server's to
+/// compute — against its clock, with its default — so reading it off the response is the only
+/// way this side ever knows when a page dies.
+@Suite("page location")
+struct PageLocationTests {
+    private func decode(_ json: String) throws -> PageLocation {
+        try JSONDecoder.stele.decode(PageLocation.self, from: Data(json.utf8))
+    }
+
+    @Test("a deadline is read off the response rather than computed here")
+    func readsTheDeadline() throws {
+        let location = try decode(
+            #"{"slug":"a-b-c","url":"https://s.example.com/a-b-c","expires":"2026-08-12T10:00:00Z"}"#
+        )
+        #expect(location.slug == "a-b-c")
+        #expect(location.expiresAt == Date(timeIntervalSince1970: 1_786_528_800))
+    }
+
+    /// Both wire shapes for "no deadline". An explicit null is what the server sends for a page
+    /// it will keep; the key is absent from a deployment older than page expiry, where nothing
+    /// expires either. Reading them the same way is not a shortcut — they mean the same thing.
+    @Test("null and absent both mean the page has no deadline", arguments: [
+        #"{"slug":"a","url":"u","expires":null}"#,
+        #"{"slug":"a","url":"u"}"#,
+    ])
+    func noDeadline(_ json: String) throws {
+        #expect(try decode(json).expiresAt == nil)
+    }
+
+    /// Fractional seconds are what a Postgres `timestamptz` renders as through most encoders,
+    /// so the deadline has to survive the same shapes every other timestamp does.
+    @Test("the deadline accepts both ISO 8601 shapes")
+    func deadlineTimestampShapes() throws {
+        let plain = try decode(#"{"slug":"a","url":"u","expires":"2026-08-12T10:00:00Z"}"#)
+        let fractional = try decode(#"{"slug":"a","url":"u","expires":"2026-08-12T10:00:00.123Z"}"#)
+        #expect(plain.expiresAt != nil)
+        #expect(fractional.expiresAt != nil)
+    }
+
+    /// `--json` is a machine contract, and the synthesised encoder would drop the key entirely
+    /// for a page that is kept — leaving a reader unable to tell "no deadline" from "this tool
+    /// said nothing about deadlines". The server hand-writes its encoder for this; so does this.
+    @Test("a kept page encodes an explicit null rather than dropping the key")
+    func encodesExplicitNull() throws {
+        let json = String(
+            decoding: try JSONEncoder().encode(PageLocation(slug: "a", url: "u")), as: UTF8.self
+        )
+        #expect(json.contains("\"expires\":null"))
+    }
+
+    /// The round trip the `--json` documentation promises: what this tool prints, it can read.
+    @Test("a location survives the round trip through its own JSON")
+    func roundTrips() throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        for expiry in [nil, Date(timeIntervalSince1970: 1_786_528_800)] {
+            let original = PageLocation(slug: "a-b-c", url: "u", expiresAt: expiry)
+            let decoded = try JSONDecoder.stele.decode(
+                PageLocation.self, from: try encoder.encode(original)
+            )
+            #expect(decoded == original)
+        }
     }
 }
 

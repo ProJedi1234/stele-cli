@@ -18,12 +18,15 @@ stored 0600 in ~/.config/stele/credentials.json
 
 $ stele publish report.html
 https://stele.example.com/quiet-cedar-otter
+expires 2026-08-11 10:31
 
-$ stele publish report.html --slug q3-report
+$ stele publish report.html --slug q3-report --ttl never
 https://stele.example.com/q3-report
+kept until deleted
 
 $ stele update q3-report report.html
 https://stele.example.com/q3-report
+kept until deleted
 
 $ stele auth status
 host       https://stele.example.com
@@ -37,7 +40,9 @@ credential ~/.config/stele/credentials.json
 
 Only the URL, the JSON and the skill document go to stdout. Prompts, warnings and errors go to
 stderr, so `url=$(stele publish page.html)` captures a URL and `stele skill | less` pages a
-document.
+document. The deadline under the URL is on stderr for that reason, and it is printed at all
+because the server's default is *ephemeral* — a page published with no `--ttl` is eventually
+unpublished, and a caller handed only a URL would find that out when the link broke.
 
 ## Commands
 
@@ -46,8 +51,8 @@ document.
 | `stele auth login [--host <url>]` | human, once | Prompts for the token on a TTY, verifies it against the server, writes the credential `0600`. |
 | `stele auth status` | agent or human | Host, client name, scopes, expiry — never the token. |
 | `stele auth logout` | human | Forgets the local credential. Does not revoke it. |
-| `stele publish <file> [--slug <name>]` | agent | `POST /pages`. Prints the URL and nothing else. |
-| `stele update <slug> <file>` | agent | `PUT /pages/:slug`. Never creates. |
+| `stele publish <file> [--slug <name>] [--ttl <days>]` | agent | `POST /pages`. Prints the URL on stdout and the page's deadline on stderr. |
+| `stele update <slug> <file>` | agent | `PUT /pages/:slug`. Never creates, and never changes the deadline. |
 | `stele skill` | agent | Proxies `GET /skill`, so the binary keeps zero copies of the contract. |
 | `stele admin clients create <name>` | operator | Mints a credential and prints the token **once**. `--scopes`, `--expires-in 90d`. |
 | `stele admin clients list` | operator | Names, scopes, last use, revocation state. |
@@ -57,6 +62,37 @@ Every command takes `--host` and `--json`. Styling is a presentation layer only;
 operations in `SteleKit` return plain data and print nothing, which is what makes `--json` a
 rendering choice rather than a second code path — and JSON output is never styled, because it is
 a machine contract.
+
+## Page lifetimes
+
+Pages are ephemeral by default. `--ttl` says otherwise:
+
+| `--ttl` | Means |
+| --- | --- |
+| omitted | the server's default lifetime, which is a matter of days |
+| `30`, `30d` | thirty days |
+| `2w` | fourteen days |
+| `never` | kept until you delete it |
+
+Two asymmetries shape the rules here. The first is why the default is ephemeral at all: a page
+that outlives its purpose fails quietly and forever, while one that expires too early fails
+loudly to somebody who can republish it. The second is why nothing is ever rounded — a lifetime
+finer than a day, like `12h`, is refused rather than quietly turned into `1d`, because the
+failure mode of guessing is a link that dies on a schedule nobody typed.
+
+The maximum is deliberately *not* enforced here. That bound belongs to the server's
+`PageLifetime`, the same way the slug rules belong to its `Slug`; a copy in this repository
+would be a second source of truth that drifts silently the day the server moves it, and the
+`400` it earns names the real limit. What this side checks is only what the server cannot: that
+you wrote something meaning a number of days, and that turning it into one does not overflow.
+
+A page's deadline is fixed when it is published. `stele update` has no `--ttl` — replacing a
+page's body cannot buy the link another week — and the server answers `?ttl=` on `PUT` with a
+`400` rather than a `200` that silently ignored it. Republish if you need a different lifetime.
+
+The deadline itself is always read off the response, never computed here: the server resolves it
+against *its* clock at the moment of the upload, applies its own default when you say nothing,
+and on `update` reports the deadline the page already had — a date this side never knew.
 
 ## Exit codes
 
