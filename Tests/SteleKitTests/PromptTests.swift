@@ -118,4 +118,108 @@ struct PromptTests {
             try prompt.secret("token: ")
         }
     }
+
+    // MARK: - the defaulted line
+
+    /// The refusal has to cover every door, not the two that existed when it was written: a
+    /// prompt that reads a pipe is a prompt that will eventually be handed a token.
+    @Test("a non-TTY stdin is refused for a defaulted line, and is never read")
+    func defaultedLineRefusesAPipe() throws {
+        let console = FakeConsole(isInteractive: false, lines: ["piped"])
+        let prompt = Prompt(console: console)
+
+        #expect(throws: PromptError.notATerminal) {
+            try prompt.line("name for this machine", default: "argos")
+        }
+        #expect(console.reads == 0)
+        #expect(console.prompts.isEmpty)
+    }
+
+    @Test("Return takes the default, and the default is shown in the prompt")
+    func returnTakesTheDefault() throws {
+        let console = FakeConsole(isInteractive: true, lines: [""])
+        let prompt = Prompt(console: console)
+
+        #expect(try prompt.line("name for this machine", default: "argos") == "argos")
+        // Shown, not merely applied. A default the prompt does not name is a Return key that
+        // does something invisible.
+        #expect(console.prompts == ["name for this machine [argos]: "])
+    }
+
+    @Test("an answer overrides the default, and is trimmed")
+    func answerOverridesTheDefault() throws {
+        let console = FakeConsole(isInteractive: true, lines: ["  laptop  "])
+        let prompt = Prompt(console: console)
+
+        #expect(try prompt.line("name for this machine", default: "argos") == "laptop")
+    }
+
+    /// Return is a person taking the offered answer. Ctrl-D is a person leaving, and a default
+    /// is not a licence to answer for somebody who has gone.
+    @Test("EOF at a defaulted prompt does not take the default")
+    func eofDoesNotTakeTheDefault() {
+        let console = FakeConsole(isInteractive: true)
+        let prompt = Prompt(console: console)
+
+        #expect(throws: PromptError.nothingEntered("nothing was entered")) {
+            try prompt.line("name for this machine", default: "argos")
+        }
+    }
+
+    // MARK: - confirmation
+
+    @Test("a non-TTY stdin is refused for a confirmation, and is never read")
+    func confirmRefusesAPipe() throws {
+        let console = FakeConsole(isInteractive: false, lines: ["y"])
+        let prompt = Prompt(console: console)
+
+        #expect(throws: PromptError.notATerminal) {
+            try prompt.confirm("revoke it?")
+        }
+        #expect(console.reads == 0)
+        #expect(console.prompts.isEmpty)
+    }
+
+    @Test("yes is explicit, and nothing else is")
+    func onlyYesMeansYes() throws {
+        for spelling in ["y", "Y", "yes", "YES", " yes "] {
+            let console = FakeConsole(isInteractive: true, lines: [spelling])
+            #expect(try Prompt(console: console).confirm("revoke it?") == true)
+        }
+    }
+
+    /// The question is only asked where the other answer destroys something, so a typo has to
+    /// fall towards leaving it alone.
+    @Test("an unrecognised answer takes the harmless default rather than looping")
+    func unrecognisedAnswerIsTheDefault() throws {
+        for noise in ["", "maybe", "ye", "sure", "1"] {
+            let console = FakeConsole(isInteractive: true, lines: [noise])
+            #expect(try Prompt(console: console).confirm("revoke it?", default: false) == false)
+        }
+    }
+
+    @Test("an explicit no is honoured even when the default is yes")
+    func explicitNoWins() throws {
+        let console = FakeConsole(isInteractive: true, lines: ["n"])
+        #expect(try Prompt(console: console).confirm("keep going?", default: true) == false)
+    }
+
+    @Test("the prompt capitalises whichever answer Return gives")
+    func promptShowsTheDefault() throws {
+        let no = FakeConsole(isInteractive: true, lines: ["y"])
+        _ = try Prompt(console: no).confirm("revoke it?", default: false)
+        #expect(no.prompts == ["revoke it? [y/N] "])
+
+        let yes = FakeConsole(isInteractive: true, lines: ["y"])
+        _ = try Prompt(console: yes).confirm("keep going?", default: true)
+        #expect(yes.prompts == ["keep going? [Y/n] "])
+    }
+
+    /// Echo stays on: a person is looking at the question and needs to see what they typed.
+    @Test("a confirmation is read with echo left on")
+    func confirmIsEchoed() throws {
+        let console = FakeConsole(isInteractive: true, lines: ["y"])
+        _ = try Prompt(console: console).confirm("revoke it?")
+        #expect(console.echoWasOffDuringRead == false)
+    }
 }

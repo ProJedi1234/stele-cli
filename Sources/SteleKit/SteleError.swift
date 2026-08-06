@@ -25,8 +25,15 @@ public enum SteleError: Error, Equatable, CustomStringConvertible {
     /// `404` — a PUT to a slug that does not exist, or an unknown client name. The advice
     /// comes from the caller, because those two have nothing useful in common to say.
     case notFound(detail: String?, advice: String)
-    /// `409` — the requested slug is taken.
+    /// `409` on a write — the requested slug is taken.
     case slugTaken(String?)
+    /// `409` on an admin route — a live credential already holds that name.
+    ///
+    /// Split from `slugTaken` rather than sharing it, because a `409` means two unrelated things
+    /// on this server and the remedies have nothing in common: one is "choose another `--slug`",
+    /// and the other is "revoke the credential holding the name, or pick a different one". A
+    /// single case answered `admin clients create` by naming a flag that command does not have.
+    case nameTaken(String?)
     /// `413` — the page is over the server's byte limit.
     case pageTooLarge(String?)
     /// `415` — the content type is not on the server's allowlist.
@@ -76,6 +83,12 @@ public enum SteleError: Error, Equatable, CustomStringConvertible {
             return """
                 that slug is already taken\(Self.suffix(detail)) Choose another `--slug`, or \
                 omit it and let the server generate one.
+                """
+        case .nameTaken(let detail):
+            return """
+                a live credential already has that name\(Self.suffix(detail)) Choose another \
+                name, or retire the existing one with `stele admin clients revoke <name>` and \
+                mint again — rotating a credential is revoke-then-mint under the same name.
                 """
         case .pageTooLarge(let detail):
             return """
@@ -149,7 +162,7 @@ extension SteleError {
         case 401: return .unauthorized
         case 403: return .forbidden(missing: expectation.scope, detail: detail)
         case 404: return .notFound(detail: detail, advice: expectation.notFoundAdvice)
-        case 409: return .slugTaken(detail)
+        case 409: return expectation.conflict.error(detail)
         case 413: return .pageTooLarge(detail)
         case 415: return .unsupportedContentType(detail)
         case 426: return .upgradeRequired(detail)
@@ -158,27 +171,53 @@ extension SteleError {
         }
     }
 
-    /// What the request was trying to do, for the two statuses whose advice depends on it.
+    /// What the request was trying to do, for the three statuses whose advice depends on it.
     struct Expectation: Sendable {
+        /// What is unique on this route, and therefore what a `409` says is already there.
+        ///
+        /// Named for the *resource* rather than for the error, because that is the thing the
+        /// route knows about itself: `/pages` has slugs, `/admin/clients` has names, and a read
+        /// has neither and should say so rather than pick one.
+        enum Conflict: Sendable {
+            case slug
+            case name
+            /// A route with nothing unique on it. A `409` here is a genuine surprise, and
+            /// `unexpectedStatus` says exactly that instead of inventing advice.
+            case none
+
+            func error(_ detail: String?) -> SteleError {
+                switch self {
+                case .slug: return .slugTaken(detail)
+                case .name: return .nameTaken(detail)
+                case .none: return .unexpectedStatus(code: 409, detail: detail)
+                }
+            }
+        }
+
         /// The scope a `403` on this route implies was missing.
         var scope: Scope?
         /// What to do about a `404` here.
         var notFoundAdvice: String
+        /// What a `409` here collided with.
+        var conflict: Conflict
 
         static let write = Expectation(
             scope: .publish,
             notFoundAdvice: """
                 `stele update` never creates a page — publish it with `stele publish` first.
-                """
+                """,
+            conflict: .slug
         )
         static let administration = Expectation(
             scope: .admin,
-            notFoundAdvice: "Check the name against `stele admin clients list`."
+            notFoundAdvice: "Check the name against `stele admin clients list`.",
+            conflict: .name
         )
         /// A read, or a route open to any valid credential.
         static let any = Expectation(
             scope: nil,
-            notFoundAdvice: "Check that the host is a stele server and that the path exists."
+            notFoundAdvice: "Check that the host is a stele server and that the path exists.",
+            conflict: .none
         )
     }
 }

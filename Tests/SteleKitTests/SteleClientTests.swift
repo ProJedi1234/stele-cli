@@ -582,6 +582,35 @@ struct SteleErrorMappingTests {
         #expect(forbiddenAdmin.description.contains("`admin` scope"))
     }
 
+    /// The third such status, and the one that was wrong until it was split. `409` means two
+    /// unrelated things on this server, and the shared case told an operator whose credential
+    /// name had collided to "choose another `--slug`" — naming a flag `admin clients create`
+    /// does not have, for a resource the request never mentioned.
+    @Test("409 says what it collided with, which depends on the route")
+    func conflictFollowsTheOperation() throws {
+        let write = try #require(SteleError.from(status: 409, detail: nil, expectation: .write))
+        let admin = try #require(
+            SteleError.from(status: 409, detail: nil, expectation: .administration)
+        )
+
+        #expect(write == .slugTaken(nil))
+        #expect(admin == .nameTaken(nil))
+        #expect(write.description.contains("--slug"))
+        #expect(admin.description.contains("stele admin clients revoke"))
+        // The specific mistake this split exists to make impossible.
+        #expect(!admin.description.contains("--slug"))
+    }
+
+    /// A read has nothing unique on it for a `409` to be about, so this client says it has no
+    /// advice rather than picking whichever of the two conflicts it was written next to.
+    @Test("409 on a route with nothing unique is an unexpected status")
+    func conflictOnAReadIsUnexpected() {
+        #expect(
+            SteleError.from(status: 409, detail: "m", expectation: .any)
+                == .unexpectedStatus(code: 409, detail: "m")
+        )
+    }
+
     /// The reader is an agent choosing between retrying, changing the input and stopping to ask
     /// a human, and a message that describes the failure without naming one of those has told it
     /// nothing it can act on. The list is that vocabulary, not a style rule.

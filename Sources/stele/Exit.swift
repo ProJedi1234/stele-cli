@@ -108,6 +108,12 @@ enum Exit {
             case .unauthorized: return credentialRejected
             case .forbidden: return forbidden
             case .slugTaken: return slugTaken
+            // Not `slugTaken`'s code, though it is the same status. That code means "pick
+            // another slug programmatically and retry", which is advice an agent acts on
+            // without a human; a credential name collides because an operator is provisioning
+            // a machine, and the fix is a decision they make. `failure` is "read the message,
+            // fix the input" — which is exactly right.
+            case .nameTaken: return failure
             case .pageTooLarge, .unsupportedContentType: return pageRejected
             case .notFound: return notFound
             case .upgradeRequired: return upgradeRequired

@@ -193,6 +193,7 @@ private func caseName(of error: SteleError) -> String {
     case .forbidden: return "forbidden"
     case .notFound: return "notFound"
     case .slugTaken: return "slugTaken"
+    case .nameTaken: return "nameTaken"
     case .pageTooLarge: return "pageTooLarge"
     case .unsupportedContentType: return "unsupportedContentType"
     case .upgradeRequired: return "upgradeRequired"
@@ -205,9 +206,9 @@ private func caseName(of error: SteleError) -> String {
 }
 
 private let everySteleErrorCase: Set<String> = [
-    "badRequest", "unauthorized", "forbidden", "notFound", "slugTaken", "pageTooLarge",
-    "unsupportedContentType", "upgradeRequired", "slugAllocationFailed", "unexpectedStatus",
-    "transportFailure", "redirected", "malformedResponse",
+    "badRequest", "unauthorized", "forbidden", "notFound", "slugTaken", "nameTaken",
+    "pageTooLarge", "unsupportedContentType", "upgradeRequired", "slugAllocationFailed",
+    "unexpectedStatus", "transportFailure", "redirected", "malformedResponse",
 ]
 
 private func caseName(of error: CredentialsError) -> String {
@@ -269,6 +270,20 @@ struct ErrorLeakTests {
         }
     }
 
+    /// The same, through an admin route. `nameTaken` cannot be produced by a publish at all —
+    /// the two conflicts are told apart by which route was asked — so reaching it honestly takes
+    /// the call that really earns it.
+    private static func mintAttempt(transport: any SteleTransport) async -> (any Error)? {
+        do {
+            let credential = try heldCredential()
+            let client = SteleClient(credential: credential, transport: transport)
+            _ = try await client.createClient(name: "argos", using: credential)
+            return nil
+        } catch {
+            return error
+        }
+    }
+
     /// Every case, produced the way production produces it — through the real client, from a
     /// response — rather than by constructing the enum with a payload chosen by the test. A
     /// hand-built `.badRequest(secret)` would prove nothing: the question is not whether the
@@ -307,6 +322,17 @@ struct ErrorLeakTests {
         produced.append(
             try #require(
                 await failure(status: 201, body: Data(echoedSecret.utf8)) as? SteleError
+            )
+        )
+        // A name collision on the admin route, whose body echoes a credential like every other
+        // answer this hostile server gives. The mint path is the one that carries an operator
+        // credential *and* returns a token, so an error assembled anywhere along it is the worst
+        // place in the library for a leak to hide.
+        produced.append(
+            try #require(
+                await Self.mintAttempt(
+                    transport: StubTransport(status: 409, body: Self.echoingBody)
+                ) as? SteleError
             )
         )
 
