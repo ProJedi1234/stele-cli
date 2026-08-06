@@ -56,6 +56,52 @@ public struct Prompt: Sendable {
         guard let line = console.readLine() else { throw .nothingEntered("nothing was entered") }
         return line.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// Reads a line with an answer already chosen, which Return accepts.
+    ///
+    /// Takes the question *without* its punctuation, unlike `line(_:)` above, and builds
+    /// `question [default]: ` itself. That is the whole reason the method exists rather than
+    /// leaving callers to interpolate the default into a label: a prompt that has a default and
+    /// does not show it is a prompt whose Return key does something invisible, and making the
+    /// caller responsible for showing it is how one eventually will not.
+    ///
+    /// End of input is still `nothingEntered` and not the default. Return is a person choosing
+    /// the offered answer; Ctrl-D is a person leaving, and answering on their behalf because
+    /// there happened to be a default would be answering for somebody who has gone.
+    public func line(_ question: String, default fallback: String) throws(PromptError) -> String {
+        guard console.isInteractive else { throw .notATerminal }
+
+        console.writePrompt("\(question) [\(fallback)]: ")
+        guard let line = console.readLine() else { throw .nothingEntered("nothing was entered") }
+        let answer = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        return answer.isEmpty ? fallback : answer
+    }
+
+    /// Asks a yes-or-no question.
+    ///
+    /// `answer` is what Return means, and it is shown in the prompt as the capitalised half of
+    /// `[y/N]`. Every caller in this tool nominates the harmless answer, because the questions
+    /// worth asking at all are the ones where the other answer destroys something.
+    ///
+    /// Anything unrecognised is the default rather than a re-ask. The alternative is a loop that
+    /// cannot be escaped by a person who has realised they are answering the wrong question, and
+    /// since the default is the harmless answer, a typo resolves to *not* doing the destructive
+    /// thing — which is the direction a misunderstanding should fall in.
+    public func confirm(
+        _ question: String,
+        default answer: Bool = false
+    ) throws(PromptError) -> Bool {
+        guard console.isInteractive else { throw .notATerminal }
+
+        console.writePrompt("\(question) [\(answer ? "Y/n" : "y/N")] ")
+        guard let line = console.readLine() else { throw .nothingEntered("nothing was entered") }
+
+        switch line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "y", "yes": return true
+        case "n", "no": return false
+        default: return answer
+        }
+    }
 }
 
 /// What a prompt can fail with. Two cases, because they call for different next steps and the

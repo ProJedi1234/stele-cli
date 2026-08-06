@@ -504,6 +504,25 @@ seed_credential "$OPERATOR" "$OPERATOR_TOKEN"
 
 run_stele publish "$WORK/page.html" --slug "$SLUG"
 expect_eq "409 slug taken -> exit 5" "5" "$STATUS"
+
+# The same status, the other resource. A `409` means two unrelated things on this server
+# and the client only learns which from the route it asked — so this is a real-server
+# assertion the unit tests cannot make on their own, and the mistake it guards against
+# (telling an operator whose credential name collided to "choose another --slug") was
+# live until the conflict was split.
+# `$OPERATOR` and not `$AGENT`: a revoked name does not hold the name — the server frees it
+# so a credential can be rotated under the same one — and `$AGENT` was revoked in section 9,
+# so asking for it again would earn a cheerful 201 and mint a credential this assertion
+# would then have to clean up. `$OPERATOR` is the credential this section is authenticated
+# as, so it is live by construction.
+run_stele admin clients create "$OPERATOR"
+expect_eq "409 client name taken -> exit 1" "1" "$STATUS"
+expect_contains "…and the advice is about credentials, not slugs" \
+    "stele admin clients revoke" "$ERR"
+case "$ERR" in
+    *--slug*) fail "the name conflict does not mention --slug" "no --slug" "$ERR" ;;
+    *) pass "the name conflict does not mention --slug" ;;
+esac
 run_stele update "smoke-no-such-page-$RUN_ID" "$WORK/page.html"
 expect_eq "404 no such page -> exit 7" "7" "$STATUS"
 run_stele publish "$WORK/page.html" --content-type application/json

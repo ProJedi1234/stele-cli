@@ -67,13 +67,24 @@ public struct ClientSummary: Codable, Sendable, Equatable {
     public let expiresAt: Date?
     public let revokedAt: Date?
 
+    /// Whether the server synthesised this credential from `STELE_UPLOAD_TOKEN` rather than
+    /// reading it out of a row.
+    ///
+    /// `Bool?` and not `Bool`, because the field is newer than the deployments that will answer
+    /// this call: a server that has never heard of it omits the key, the synthesised decoder
+    /// reaches for `decodeIfPresent`, and nil arrives meaning "this server does not say". Nil is
+    /// therefore genuinely a third state and not a defaulted `false` — `LoginDecision.isShared`
+    /// falls back to the name only when it lands, and prefers this answer whenever there is one.
+    public let shared: Bool?
+
     public init(
         name: String,
         scopes: [String],
         createdAt: Date? = nil,
         lastUsedAt: Date? = nil,
         expiresAt: Date? = nil,
-        revokedAt: Date? = nil
+        revokedAt: Date? = nil,
+        shared: Bool? = nil
     ) {
         self.name = name
         self.scopes = scopes
@@ -81,6 +92,7 @@ public struct ClientSummary: Codable, Sendable, Equatable {
         self.lastUsedAt = lastUsedAt
         self.expiresAt = expiresAt
         self.revokedAt = revokedAt
+        self.shared = shared
     }
 
     public var isRevoked: Bool { revokedAt != nil }

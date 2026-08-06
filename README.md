@@ -48,7 +48,7 @@ unpublished, and a caller handed only a URL would find that out when the link br
 
 | Command | Who runs it | Does |
 | --- | --- | --- |
-| `stele auth login [--host <url>]` | human, once | Prompts for the token on a TTY, verifies it against the server, writes the credential `0600`. |
+| `stele auth login [--host <url>] [--admin]` | human, once | Prompts for the token on a TTY, verifies it, writes the credential `0600`. An operator token is *spent*, not stored — see below. |
 | `stele auth status` | agent or human | Host, client name, scopes, expiry — never the token. |
 | `stele auth logout` | human | Forgets the local credential. Does not revoke it. |
 | `stele publish <file> [--slug <name>] [--ttl <days>]` | agent | `POST /pages`. Prints the URL on stdout and the page's deadline on stderr. |
@@ -62,6 +62,59 @@ Every command takes `--host` and `--json`. Styling is a presentation layer only;
 operations in `SteleKit` return plain data and print nothing, which is what makes `--json` a
 rendering choice rather than a second code path — and JSON output is never styled, because it is
 a machine contract.
+
+## Getting a credential onto a machine
+
+An `admin` token is not a credential to keep. It is the one thing that can mint credentials, and
+on this server it cannot even publish — `admin` and `publish` are disjoint, so a machine holding
+the operator token can revoke every credential on the deployment and cannot upload a page.
+
+So `stele auth login` spends it. Paste an operator token and it mints a publish-only credential
+named after the machine, stores *that*, and never writes what you pasted to disk:
+
+```
+$ stele auth login
+host (e.g. https://stele.example.com): https://stele.example.com
+token for https://stele.example.com:
+that is https://stele.example.com's bootstrap token (shared-upload-token). It is configuration
+rather than a credential — it stops working when the deployment is redeployed — and it carries
+`admin`, so storing it here would let anything on this machine mint and revoke credentials.
+Minting a publish-only credential for this machine instead. Pass --admin to store the operator
+credential as it stands.
+name for this machine [argos]:
+authenticated as argos on https://stele.example.com — scopes: publish
+stored 0600 in ~/.config/stele/credentials.json
+the admin token was not written to disk.
+```
+
+A publish-only token takes the path it always took: verified, stored, nothing else said.
+
+If the name is already live the credential is not silently replaced — rotating one is
+revoke-then-mint under the same name, which destroys whatever is publishing under it today, so
+it asks:
+
+```
+name for this machine [argos]:
+a credential named argos is already live on https://stele.example.com (created 2026-06-02, last
+used 2026-08-04).
+revoke it and mint a replacement? [y/N]
+```
+
+Declining asks for another name instead.
+
+`--admin` stores the operator token as it stands, which is what the workstation you administer
+the deployment from wants. The credential file holds one credential per host, so that machine
+holds `admin` *instead of* `publish` and `stele publish` stops working on it.
+
+`stele admin clients create` is unchanged and still the way to provision a machine you are not
+sitting at, or to mint a credential with a non-default scope or lifetime. What changed is that
+it is no longer the only way — and the common case, a machine credentialling itself, no longer
+routes a shown-once secret through a second terminal.
+
+One trade this makes deliberately: the operator token now gets typed at a TTY on the machine
+being provisioned, rather than never leaving the workstation. It is read with echo off, used for
+one request and never written down — but it is a real exposure, and `admin clients create`
+remains available for anyone who would rather carry the minted token instead.
 
 ## Page lifetimes
 
