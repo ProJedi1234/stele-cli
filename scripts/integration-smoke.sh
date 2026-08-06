@@ -511,7 +511,7 @@ expect_eq "409 slug taken -> exit 5" "5" "$STATUS"
 # (telling an operator whose credential name collided to "choose another --slug") was
 # live until the conflict was split.
 # `$OPERATOR` and not `$AGENT`: a revoked name does not hold the name — the server frees it
-# so a credential can be rotated under the same one — and `$AGENT` was revoked in section 9,
+# so a credential can be rotated under the same one — and `$AGENT` was revoked in section 10,
 # so asking for it again would earn a cheerful 201 and mint a credential this assertion
 # would then have to clean up. `$OPERATOR` is the credential this section is authenticated
 # as, so it is live by construction.

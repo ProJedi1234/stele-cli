@@ -110,13 +110,22 @@ struct LoginCommand: SteleCommand {
                 on: host,
                 client: client
             )
-            try store(
-                try minted.token.inCustody(),
-                as: minted.client,
-                on: host,
-                minted: true,
-                into: &credentials
-            )
+            // Converted here rather than inline at the `store` call, so the failure lands in
+            // this `catch` instead of escaping as a bare `malformedToken`. The bad state is the
+            // same one `store` guards against — a row created on the server whose plaintext is
+            // gone — and it deserves the same message, since the operator's next move is the
+            // same too.
+            let token: Token
+            do {
+                token = try minted.token.inCustody()
+            } catch {
+                throw Self.orphaned(
+                    minted.client.name,
+                    on: host,
+                    "the token it sent back is not one a credential can hold."
+                )
+            }
+            try store(token, as: minted.client, on: host, minted: true, into: &credentials)
         }
     }
 
@@ -141,7 +150,7 @@ struct LoginCommand: SteleCommand {
         // prompt, so it cannot spin on its own — but a revoke that succeeds followed by a create
         // that still collides is a state no amount of asking will get out of, and looping on it
         // would keep asking anyway.
-        for _ in 0..<Self.nameAttempts {
+        for attempt in 0..<Self.nameAttempts {
             do {
                 // Sent as typed. The alphabet is the server's `Client.validated(name:)` and a
                 // copy of it here would be a second source of truth — a `400` names the rule it
@@ -151,6 +160,11 @@ struct LoginCommand: SteleCommand {
                 )
             } catch let error as SteleError {
                 guard case .nameTaken = error else { throw error }
+                // Only worth resolving while there is a create left to use the answer. On the
+                // last turn the resolution would still prompt — and a `y` there revokes a live
+                // credential, whatever was publishing under that name stops, and then the loop
+                // falls out and mints nothing. Better to fail with the name still working.
+                guard attempt < Self.nameAttempts - 1 else { break }
                 name = try await resolveNameConflict(
                     named: name, using: operatorCredential, on: host, client: client
                 )
@@ -184,8 +198,16 @@ struct LoginCommand: SteleCommand {
         // Best effort, and only to make the question answerable: "last used yesterday" is what
         // tells an operator whether anything is still publishing under this name. A listing that
         // fails costs the dates and not the prompt.
+        //
+        // Revoked rows are skipped, and that is the whole point of the filter: the server's
+        // name uniqueness is a *partial* index over the live rows, so a name that has been
+        // rotated before appears several times in this listing. The listing is oldest-first,
+        // so the unfiltered answer is the retired credential — which would put months-old
+        // dates in front of the operator as though they described the thing about to be
+        // destroyed. `last` rather than `first` for the same reason, belt and braces: the
+        // newest live row is the one holding the name.
         let existing = try? await client.listClients(using: operatorCredential)
-            .first { $0.name == name }
+            .last { $0.name == name && !$0.isRevoked }
         let described = existing.map {
             " (created \(Format.moment($0.createdAt)), last used \(Format.moment($0.lastUsedAt)))"
         } ?? ""
@@ -195,7 +217,17 @@ struct LoginCommand: SteleCommand {
         )
 
         guard try Prompt().confirm("revoke it and mint a replacement?") else {
-            return try Prompt().line("another name for this machine: ")
+            let replacement = try Prompt().line("another name for this machine: ")
+            // No default is offered here, because the only obvious name is the one that just
+            // collided — so Return means nothing, and this says so. Sending the empty string
+            // would spend the attempt on a `400` from the server's name validator, arriving
+            // after the operator has already answered three prompts.
+            guard !replacement.isEmpty else {
+                throw Failure(
+                    "no name was entered. Nothing was minted — run `stele auth login` again."
+                )
+            }
+            return replacement
         }
 
         let revoked = try await client.revokeClient(name: name, using: operatorCredential)
@@ -222,15 +254,9 @@ struct LoginCommand: SteleCommand {
         do {
             try options.store.save(credentials)
         } catch {
-            // A minted credential is live on the server and this was the only copy of its
-            // plaintext — the server keeps a hash and cannot reissue it. Failing with the
-            // generic write error would leave a credential nobody can use and nobody knows to
-            // revoke, so the message carries the name needed to clean it up.
             guard minted else { throw error }
-            throw Failure(
-                "minted '\(summary.name)' on \(host), but could not write the credential file: "
-                    + "\(error) That credential is live and its token is now lost — revoke it "
-                    + "with `stele admin clients revoke \(summary.name)`."
+            throw Self.orphaned(
+                summary.name, on: host, "could not write the credential file: \(error)."
             )
         }
 
@@ -259,6 +285,21 @@ struct LoginCommand: SteleCommand {
             // saying where it is true — so it is printed on this branch and not as a footer.
             Terminal.out(style.dim("the admin token was not written to disk."))
         }
+    }
+
+    /// A credential that is live on the server and whose only copy of the plaintext is gone.
+    ///
+    /// The server keeps a hash and cannot reissue it, so what is left is a credential nobody can
+    /// use and nobody knows to revoke. Two routes reach this state — a token the file would not
+    /// take, and a token this side could not hold — and both need the same thing from the
+    /// operator, so the message is written once rather than twice into drift.
+    private static func orphaned(
+        _ name: String, on host: SteleHost, _ problem: String
+    ) -> Failure {
+        Failure(
+            "minted '\(name)' on \(host), but \(problem) That credential is live and its token "
+                + "is now lost — revoke it with `stele admin clients revoke \(name)`."
+        )
     }
 
     /// Why this command is about to do something the user did not ask for.
