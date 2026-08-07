@@ -95,6 +95,22 @@ public struct SteleClient: Sendable {
         }()
     }
 
+    /// Query parameters this client sends, named once for `Path`'s reason and a sharper version
+    /// of its failure. A misspelled path is a `404` and says so; a misspelled query parameter is
+    /// *silence* — the server looks the name up, does not find it, and does whatever it would
+    /// have done had the caller passed nothing. `?slgu=` on a publish is a generated slug instead
+    /// of the one asked for, and on an amendment it is a page retimed but never renamed. Both
+    /// answer `200`.
+    ///
+    /// `?ttl=` is spelled by `PageTTL.queryParameter`, which sits with the type that owns the
+    /// value and its `never` keyword.
+    public enum Query {
+        /// The name a page is asked to have — the one on `POST /pages`, and the *new* one on
+        /// `PATCH /pages/:slug`. One word on the wire in both places, and a literal at each call
+        /// site would be two strings that have to agree with each other and with the server.
+        public static let slug = "slug"
+    }
+
     /// The type a page body is sent as when the caller expresses no opinion.
     ///
     /// The CLI owning this decision is the point of the tool: the `curl` recipe the skill used
@@ -123,7 +139,7 @@ public struct SteleClient: Sendable {
         ttl: PageTTL? = nil,
         using credential: Credential
     ) async throws -> PageLocation {
-        var query = slug.map { [URLQueryItem(name: "slug", value: $0)] } ?? []
+        var query = slug.map { [URLQueryItem(name: Query.slug, value: $0)] } ?? []
         if let ttl {
             query.append(URLQueryItem(name: PageTTL.queryParameter, value: ttl.queryValue))
         }
@@ -142,8 +158,11 @@ public struct SteleClient: Sendable {
     /// `PUT /pages/:slug`. Replaces a page that already exists; never creates one.
     ///
     /// Takes no `ttl`, and not by omission — the server answers `?ttl=` on this verb with a
-    /// `400`. A page's deadline is fixed when it is published, so replacing the body cannot
-    /// quietly buy the link another week. The response still reports the deadline the page has.
+    /// `400`. What is fixed is not the deadline itself but the deadline's relationship to *this*
+    /// verb: a page's expiry belongs to the page rather than to its current body, so replacing
+    /// the body cannot quietly buy the link another week. A deadline does move — under its own
+    /// verb, with no bytes attached to it. See `amend`. The response still reports the deadline
+    /// the page has.
     public func update(
         slug: String,
         page: Data,
@@ -157,6 +176,64 @@ public struct SteleClient: Sendable {
             body: page,
             credential: credential,
             expectation: .write,
+            decoding: PageLocation.self
+        )
+    }
+
+    /// `PATCH /pages/:slug`. Renames a page, moves its deadline, or both — and writes no bytes.
+    ///
+    /// The trap worth reading before anything else: `ttl: nil` here means **leave the deadline
+    /// exactly where it is**, where the same `nil` on `publish` means "take whatever lifetime
+    /// the server defaults to". `PageTTL?` cannot express that difference on its own — it is one
+    /// optional with one absent case, and the two verbs read that absence in opposite ways — so
+    /// the distinction rests entirely on this method never inventing a value. A `ttl=7` sent
+    /// because seven looked like a reasonable default would put a week's deadline on a page its
+    /// author published to keep forever, and nothing about the response would look wrong
+    /// afterwards. So `?ttl=` travels only when the caller passed one, and `?slug=` only when the
+    /// caller passed one; neither ever carries a placeholder. Passing neither is the server's
+    /// `400` ("Nothing to amend"), which this method does not second-guess — a caller holding a
+    /// command line can refuse it before spending the round trip, and the CLI does.
+    ///
+    /// Read the resulting address off the returned `PageLocation`; never rebuild it from
+    /// `newSlug`. The server is the only thing that knows what actually happened — renaming a
+    /// page to the name it already has is a successful no-op — and it answers with the slug the
+    /// store settled on rather than the one that was asked for. A second place computing that
+    /// answer is a second place to get it wrong.
+    ///
+    /// A rename is a hard move. The old name is freed the instant it commits: no redirect, no
+    /// tombstone, and it goes straight back into the pool for anybody's next page. Every link
+    /// already in circulation therefore breaks — as an ordinary `404` at first, and then, if
+    /// someone else claims the name, as a link that quietly points at their page instead. That
+    /// is the real cost of this verb, and the reason a caller should know whether the old URL
+    /// has been handed to anyone before spending it.
+    ///
+    /// `?ttl=` is measured from *now*, not from the page's creation, so `.days(30)` grants
+    /// thirty fresh days rather than whatever is left of them. It cannot raise the dead: an
+    /// expired page is gone as far as every verb on this server is concerned, so `.never` aimed
+    /// at one is a `404` and not a resurrection.
+    ///
+    /// Attribution is deliberately left alone, which is the inversion of `update`: `client_id`
+    /// records who wrote a page's bytes, and an amendment writes none. Contents, content type
+    /// and creation time survive for the same reason.
+    public func amend(
+        slug: String,
+        newSlug: String? = nil,
+        ttl: PageTTL? = nil,
+        using credential: Credential
+    ) async throws -> PageLocation {
+        var query: [URLQueryItem] = []
+        if let newSlug {
+            query.append(URLQueryItem(name: Query.slug, value: newSlug))
+        }
+        if let ttl {
+            query.append(URLQueryItem(name: PageTTL.queryParameter, value: ttl.queryValue))
+        }
+        return try await send(
+            method: "PATCH",
+            path: Path.page(slug: slug),
+            query: query,
+            credential: credential,
+            expectation: .amend,
             decoding: PageLocation.self
         )
     }

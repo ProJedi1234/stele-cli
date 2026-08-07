@@ -334,6 +334,8 @@ expect_eq "--ttl never exits 0" "0" "$STATUS"
 printf '%s' "$OUT" > "$WORK/page-never.json"
 expect_eq "…and the page is kept: an explicit null, not a missing key" "null" \
     "$(json_key_state "$WORK/page-never.json" expires)"
+# Kept means kept: this row outlives the run, so its name is held for the footer to report.
+NEVER_SLUG="$(json_field "$WORK/page-never.json" slug)"
 
 run_stele publish "$WORK/page.html" --ttl 1
 expect_eq "--ttl 1 exits 0" "0" "$STATUS"
@@ -393,6 +395,142 @@ run_stele update "$SLUG" "$WORK/page2.html" --ttl never
 # and something later refused it, which is the outcome this check exists to rule out.
 expect_eq "update has no --ttl to give" "64" "$STATUS"
 expect_contains "…and says so rather than silently extending the page" "--ttl" "$ERR"
+
+# ---------------------------------------------------------------------------------
+section "5b. amend moves the name and the deadline, and nothing else"
+# ---------------------------------------------------------------------------------
+
+MOVED="smoke-moved-$RUN_ID"
+ARRIVED="smoke-arrived-$RUN_ID"
+
+# Published with no --ttl deliberately. An ephemeral page is the one a rename could quietly
+# re-date, and the deadline recorded here is the value the rename checks below compare against.
+run_stele publish "$WORK/page.html" --slug "$MOVED" --json
+expect_eq "a page to amend is published" "0" "$STATUS"
+printf '%s' "$OUT" > "$WORK/amend-before.json"
+MOVED_URL="$(json_field "$WORK/amend-before.json" url)"
+MOVED_EXPIRY="$(json_field "$WORK/amend-before.json" expires)"
+expect_eq "…and it has a deadline to preserve" "set" \
+    "$(json_key_state "$WORK/amend-before.json" expires)"
+
+run_stele amend "$MOVED" --slug "$ARRIVED"
+expect_eq "amend --slug exits 0" "0" "$STATUS"
+# What this pins is that the rename landed where it was asked to and that the URL on stdout is
+# the page's new address rather than the one that was passed in. What it does *not* pin, and
+# cannot: that the address was read off the response. A client that rebuilt it as host + its own
+# --slug argument prints this same string, and only a server answering with a different slug
+# would separate the two — which nothing here can arrange. `resultingSlugComesFromTheServer` in
+# SteleClientTests is the check that holds that half, with a fake transport that does exactly
+# that; if this line ever looks like the belt to its braces, it is not one.
+expect_eq "…and prints the URL the page now has, not the one it was asked about" \
+    "$HOST/$ARRIVED" "$OUT"
+ARRIVED_URL="$OUT"
+
+curl -sS "$ARRIVED_URL" -o "$WORK/moved.html"
+if cmp -s "$WORK/page.html" "$WORK/moved.html"; then
+    pass "the bytes are served at the new name, unchanged by the move"
+else
+    fail "the bytes are served at the new name" "the file that was published" \
+        "$(diff "$WORK/page.html" "$WORK/moved.html" | head -5)"
+fi
+# An amendment writes no bytes, so it must not have opinions about what they are either.
+expect_eq "…still as text/html, a type the amendment never touched" "text/html; charset=utf-8" \
+    "$(curl -sS -o /dev/null -w '%{content_type}' "$ARRIVED_URL")"
+
+# The hard move, and the assertion worth having. No redirect, no tombstone, no 410 saying the
+# page went somewhere: the old name is *freed*, and whoever kept the link gets the same 404 as
+# a name that was never published at all. Nothing else in this suite watches a slug go back
+# into the pool, and a well-meant redirect would be an invisible change to what a link means.
+expect_eq "…and the old name 404s at once, with nothing left behind" "404" \
+    "$(http_status "$MOVED_URL")"
+
+# Back again, which asks two questions in one request. The freed name has to be claimable —
+# by this page or by anybody's next one — and the deadline has to have survived both moves
+# untouched. That second half is the trap the whole route turns on: --ttl was not passed, so
+# the CLI must have sent no ttl parameter at all. A defaulted one would surface here as a
+# deadline a week out instead of the one this page was published with.
+run_stele amend "$ARRIVED" --slug "$MOVED" --json
+expect_eq "the freed name is claimable again, exit 0" "0" "$STATUS"
+printf '%s' "$OUT" > "$WORK/amend-back.json"
+expect_eq "…and the response names the resulting slug" "$MOVED" \
+    "$(json_field "$WORK/amend-back.json" slug)"
+expect_eq "…while a rename alone leaves the deadline exactly where it was" \
+    "$MOVED_EXPIRY" "$(json_field "$WORK/amend-back.json" expires)"
+
+# --ttl alone, the other half of the route, and `never` is the state worth landing on: the
+# CLI's encoder says "kept" out loud as a null rather than dropping the key, which 4b pins for
+# publish and which an amendment has to spell the same way or a reader learns nothing.
+run_stele amend "$MOVED" --ttl never --json
+expect_eq "amend --ttl exits 0" "0" "$STATUS"
+printf '%s' "$OUT" > "$WORK/amend-never.json"
+expect_eq "…and the page that had a deadline is kept: an explicit null" "null" \
+    "$(json_key_state "$WORK/amend-never.json" expires)"
+expect_eq "…while a retime alone leaves the name where it was" "$MOVED" \
+    "$(json_field "$WORK/amend-never.json" slug)"
+
+KEPT="smoke-kept-$RUN_ID"
+KEPT_MOVED="smoke-kept-moved-$RUN_ID"
+
+# The reason this section exists. A page published to be kept, renamed with --slug and nothing
+# else. On POST an absent ttl means the default lifetime; on PATCH it means "do not touch the
+# deadline", and a client that sends its own default to save the server the trouble hands a
+# permanent page a week to live — silently, with a 200 and a URL that looks perfectly fine.
+# This is the only check anywhere that would notice. The null is the whole assertion.
+run_stele publish "$WORK/page.html" --slug "$KEPT" --ttl never --json
+expect_eq "a kept page is published" "0" "$STATUS"
+printf '%s' "$OUT" > "$WORK/kept-before.json"
+expect_eq "…with no deadline at all" "null" "$(json_key_state "$WORK/kept-before.json" expires)"
+
+run_stele amend "$KEPT" --slug "$KEPT_MOVED" --json
+expect_eq "renaming a kept page exits 0" "0" "$STATUS"
+printf '%s' "$OUT" > "$WORK/kept-after.json"
+expect_eq "…and it is still kept: a rename does not hand it the default lifetime" "null" \
+    "$(json_key_state "$WORK/kept-after.json" expires)"
+
+# An amendment naming nothing to amend is refused by the command, not by the server's 400 —
+# which is a claim about *when* it fails, so the credential file is parked to prove it. With
+# nothing to authenticate with, a check that reached the transport would have died asking for
+# `stele auth login`; this one still names the missing flags, so it never left the process.
+mv "$CRED" "$WORK/credential.parked"
+run_stele amend "$MOVED"
+expect_eq "amend with neither --slug nor --ttl is refused, exit 1" "1" "$STATUS"
+expect_contains "…and names the flags that would fix it" "--slug" "$ERR"
+expect_eq "…printing no URL" "" "$OUT"
+case "$ERR" in
+    *"auth login"*) fail "…refusing before it reads a credential, so nothing was sent" \
+        "the nothing-to-amend message" "$ERR" ;;
+    *) pass "…refusing before it reads a credential, so nothing was sent" ;;
+esac
+mv "$WORK/credential.parked" "$CRED"
+
+# The same 409 vocabulary `publish --slug` earns, now on a route that can collide without
+# uploading anything: $MOVED is live, so asking for its name is a conflict about slugs.
+run_stele amend "$KEPT_MOVED" --slug "$MOVED"
+expect_eq "409 amend onto a name another page holds -> exit 5" "5" "$STATUS"
+expect_contains "…naming the flag to change" "--slug" "$ERR"
+# The other half of the advice has to be this route's own too. `publish`'s sentence ends "or
+# omit it and let the server generate one", and an agent that took that branch here would ask
+# for no rename at all: the server allocates nothing on PATCH, so it would meet the local
+# "nothing to amend" refusal and exit 1 without a request ever going out.
+case "$ERR" in
+    *"generate one"*) fail "…and not by telling it to omit --slug, which renames nothing" \
+        "advice about choosing a different name" "$ERR" ;;
+    *) pass "…and not by telling it to omit --slug, which renames nothing" ;;
+esac
+
+# 404, with advice that has to be this route's own. The one `update` shares would send the
+# reader to `stele update`, which is the wrong verb twice over — there is no page there to
+# replace either — and the useful thing to say is that amend never creates and cannot revive,
+# because the obvious next guess for a page that has expired is `--ttl never`, which fails
+# exactly the same way.
+run_stele amend "smoke-no-such-page-$RUN_ID" --ttl never
+expect_eq "404 amend a slug with no live page -> exit 7" "7" "$STATUS"
+expect_contains "…and the advice says amend never creates one" "never creates one" "$ERR"
+case "$ERR" in
+    *"stele update"*) fail "…and does not send the reader to \`stele update\`" \
+        "advice about publishing the page again" "$ERR" ;;
+    *) pass "…and does not send the reader to \`stele update\`" ;;
+esac
 
 # ---------------------------------------------------------------------------------
 section "6. --expires-in survives the round trip"
@@ -568,7 +706,14 @@ expect_contains "…and returns the server's own skill document" "stele auth sta
 # ---------------------------------------------------------------------------------
 
 printf '\n\033[32msmoke: %d checks passed.\033[0m\n' "$CHECKS"
-printf 'Left behind on %s: 2 pages (%s, %s) and %d client rows, revoked.\n' \
-    "$HOST" "$SLUG" "$AGENT_SLUG" 3
+# Eight pages, and the count is kept honest by hand because nothing here tracks them: sections 4
+# and 8 publish one each, 4b publishes four to compare lifetimes, and 5b leaves two. Only the
+# three below are permanent — the rest carry a deadline and the server reclaims them on its own
+# schedule — so those three are the ones named, because they are the ones a human ends up
+# deleting. Naming two of the ephemeral ones instead, as this line used to, sent whoever was
+# tidying up home with six rows still on the deployment.
+printf 'Left behind on %s: 8 pages and %d client rows, revoked.\n' "$HOST" 3
+printf 'Five of the pages expire on their own; these three never do: %s, %s, %s.\n' \
+    "$NEVER_SLUG" "$MOVED" "$KEPT_MOVED"
 printf 'The server has no delete route, so pages and revoked credentials accumulate —\n'
 printf 'which is why this belongs on a throwaway deployment, not a real one.\n'

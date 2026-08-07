@@ -148,6 +148,180 @@ struct SteleClientRequestTests {
         #expect(request.url.absoluteString == "https://stele.example.com/pages/my-page")
     }
 
+    @Test("amend patches the slug's own path")
+    func amend() async throws {
+        let transport = FakeTransport(
+            status: 200,
+            body: """
+                {"slug":"loud-cedar-otter","url":"https://stele.example.com/loud-cedar-otter",
+                 "expires":null}
+                """
+        )
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        let location = try await client.amend(
+            slug: "quiet-cedar-otter", newSlug: "loud-cedar-otter", using: credential
+        )
+
+        #expect(location.slug == "loud-cedar-otter")
+        let request = try #require(await transport.last)
+        #expect(request.method == "PATCH")
+        // Addressed at the page as it is *now*: the old name is what identifies the row, and the
+        // new one is what is being asked for, so they cannot swap places.
+        #expect(
+            request.url.absoluteString
+                == "https://stele.example.com/pages/quiet-cedar-otter?slug=loud-cedar-otter"
+        )
+    }
+
+    /// The load-bearing one. `ttl: nil` means opposite things on the two verbs — on `publish` it
+    /// asks for the server's default lifetime, and here it means *leave the deadline alone* — and
+    /// nothing in the type system carries that difference. It rests entirely on this request not
+    /// inventing a value. A `ttl=7` appended because seven looked like a sensible default would
+    /// put a week's deadline on a page its author published to keep forever, and the `200` that
+    /// came back would look exactly like the one a correct request earns; the page would simply
+    /// be gone the following week. So the assertion is absence rather than emptiness: `?ttl=`
+    /// with nothing after it is a value too, and a value is the thing that must not be sent.
+    @Test("a rename with no lifetime sends no ttl at all")
+    func renameSendsNoLifetime() async throws {
+        let transport = FakeTransport(status: 200, body: #"{"slug":"new-name","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.amend(slug: "old-name", newSlug: "new-name", using: credential)
+
+        let request = try #require(await transport.last)
+        #expect(request.url.query == "slug=new-name")
+        // Not merely "no ttl parameter": no `ttl` anywhere in the request at all, which is the
+        // form the assertion has to take because an empty or defaulted one would still parse.
+        #expect(!request.url.absoluteString.contains("ttl"))
+    }
+
+    /// The mirror, and the reason the two parameters are appended independently rather than
+    /// built as a pair: retiming a page must not rename it, and `?slug=` echoing the page's
+    /// current name would be a rename that happens to be a no-op today and a collision the day
+    /// the caller passes a stale slug.
+    @Test("a lifetime with no rename sends no slug at all")
+    func retimeSendsNoSlug() async throws {
+        let transport = FakeTransport(status: 200, body: #"{"slug":"old-name","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.amend(slug: "old-name", ttl: .days(30), using: credential)
+
+        let request = try #require(await transport.last)
+        let query = try #require(request.url.query)
+        #expect(query == "ttl=30")
+        #expect(!query.contains("slug"))
+    }
+
+    /// The server takes both in one `PATCH`, so a caller that asked for both gets one round trip
+    /// and one outcome. Split into two requests they could half-succeed — a page renamed and
+    /// still dying on Thursday — with no verb left to say so.
+    @Test("a rename and a lifetime travel together in one request")
+    func renameAndLifetime() async throws {
+        let transport = FakeTransport(status: 200, body: #"{"slug":"new-name","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.amend(
+            slug: "old-name", newSlug: "new-name", ttl: .never, using: credential
+        )
+
+        let request = try #require(await transport.last)
+        #expect(request.url.query == "slug=new-name&ttl=never")
+        #expect(await transport.requests.count == 1)
+    }
+
+    /// Spelled the server's way, from the server's own constant. `ttl=forever` would be a `400`
+    /// and a computed date would be a deadline rather than the absence of one — and `never` is
+    /// the only word this route reads as "keep it".
+    @Test("an amended lifetime of never travels as the server's own keyword")
+    func amendNeverKeyword() async throws {
+        let transport = FakeTransport(status: 200, body: #"{"slug":"old-name","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.amend(slug: "old-name", ttl: .never, using: credential)
+
+        #expect(try #require(await transport.last).url.query == "ttl=\(PageTTL.neverKeyword)")
+    }
+
+    /// An amendment writes no bytes — that is the whole shape of the verb, and the reason the
+    /// server leaves `client_id` alone where `PUT` overwrites it. A `Content-Type` on it would
+    /// be a claim about content this request is not sending, and a body would be bytes the
+    /// server has already promised not to read.
+    @Test("amend sends no body and no content type")
+    func amendSendsNothing() async throws {
+        let transport = FakeTransport(status: 200, body: #"{"slug":"new-name","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.amend(slug: "old-name", newSlug: "new-name", using: credential)
+
+        let request = try #require(await transport.last)
+        #expect(request.body == nil)
+        #expect(request.contentType == nil)
+        #expect(request.headerFields()["Content-Type"] == nil)
+        // Still authenticated, though: an amendment is a write and carries the publish scope.
+        #expect(request.headerFields()["Authorization"] == "Bearer stele_pat_test")
+    }
+
+    /// The server has the last word on what the page is now called, and this side reads it off
+    /// the response rather than assuming the request got what it asked for. Renaming a page to
+    /// the name it already has is a successful no-op, so "what was asked for" and "what the store
+    /// settled on" are genuinely different questions — and a URL rebuilt from `newSlug` would be
+    /// right often enough to survive review and wrong the day it mattered.
+    @Test("the resulting slug is the server's answer, not the one that was asked for")
+    func resultingSlugComesFromTheServer() async throws {
+        let transport = FakeTransport(
+            status: 200,
+            body: """
+                {"slug":"server-settled-on-this",
+                 "url":"https://stele.example.com/server-settled-on-this","expires":null}
+                """
+        )
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        let location = try await client.amend(
+            slug: "old-name", newSlug: "asked-for-this", using: credential
+        )
+
+        #expect(location.slug == "server-settled-on-this")
+        #expect(location.url == "https://stele.example.com/server-settled-on-this")
+    }
+
+    /// The *other* surface a slug arrives on, and it is protected by something different from
+    /// the path segment's percent-encoding. A query value is not a path: dot-segment removal
+    /// never looks at it, so `../admin/clients` stays a string sitting in `?slug=`, unresolved,
+    /// and the request still acts on the page named in the path. That is the property worth
+    /// asserting — not an escaping that does not happen here. What the value *means* is the
+    /// server's `Slug` type's business, and a name like this comes back as the `400` that names
+    /// the rule it broke, which is exactly where that judgement belongs.
+    @Test("a new slug cannot climb out of /pages")
+    func newSlugStaysInTheQuery() async throws {
+        let transport = FakeTransport(status: 200, body: #"{"slug":"x","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try? await client.amend(
+            slug: "quiet-cedar-otter", newSlug: "../admin/clients", using: credential
+        )
+
+        let request = try #require(await transport.last)
+        #expect(request.url.path == "/pages/quiet-cedar-otter")
+        #expect(request.url.standardized.path == "/pages/quiet-cedar-otter")
+        // It travelled as a value, whole, for the server to reject on its own terms.
+        let components = try #require(
+            URLComponents(url: request.url, resolvingAgainstBaseURL: false)
+        )
+        #expect(
+            components.queryItems == [URLQueryItem(name: "slug", value: "../admin/clients")]
+        )
+    }
+
     /// A slug is one path segment and must stay one, however it is spelled. Left raw it is not
     /// only a `/` away from another route: RFC 3986 removes dot segments before the request is
     /// ever sent, so `update ../admin/clients` reaches the server as `PUT /admin/clients` — an
@@ -492,6 +666,20 @@ struct PageLocationTests {
     }
 }
 
+/// The `409` advice a route carries, read back out of the case that holds it.
+///
+/// A test asserting the status→case mapping by identity has to build the expected case by hand,
+/// and the advice is part of it — but retyping the sentence here would be a copy that goes on
+/// passing while the two drift, which is the failure the advice was moved onto `Expectation` to
+/// prevent in the first place. What the identity test is for is the *case*; which route's words
+/// it carries is asserted separately, by wording, in `amendConflictIsASlug`.
+extension SteleError.Expectation {
+    var slugTakenAdvice: String {
+        guard case .slug(let advice) = conflict else { return "" }
+        return advice
+    }
+}
+
 @Suite("status mapping")
 struct SteleErrorMappingTests {
     private func failure(status: Int, body: String = "") async -> (any Error)? {
@@ -501,6 +689,22 @@ struct SteleErrorMappingTests {
                 credential: credential, transport: FakeTransport(status: status, body: body)
             )
             _ = try await client.publish(page: Data("x".utf8), using: credential)
+            return nil
+        } catch {
+            return error
+        }
+    }
+
+    /// The same round trip through `amend`, so what is asserted is the advice this *route*
+    /// produces rather than the `Expectation` a test picked by hand — the mistake being guarded
+    /// against is the call site passing the wrong one.
+    private func amendFailure(status: Int, body: String = "") async -> (any Error)? {
+        do {
+            let credential = try testCredential()
+            let client = SteleClient(
+                credential: credential, transport: FakeTransport(status: status, body: body)
+            )
+            _ = try await client.amend(slug: "old-name", newSlug: "new-name", using: credential)
             return nil
         } catch {
             return error
@@ -540,7 +744,12 @@ struct SteleErrorMappingTests {
             (401, .unauthorized),
             (403, .forbidden(missing: .publish, detail: "m")),
             (404, .notFound(detail: "m", advice: SteleError.Expectation.write.notFoundAdvice)),
-            (409, .slugTaken("m")),
+            (
+                409,
+                .slugTaken(
+                    detail: "m", advice: SteleError.Expectation.write.slugTakenAdvice
+                )
+            ),
             (413, .pageTooLarge("m")),
             (415, .unsupportedContentType("m")),
             (426, .upgradeRequired("m")),
@@ -593,12 +802,60 @@ struct SteleErrorMappingTests {
             SteleError.from(status: 409, detail: nil, expectation: .administration)
         )
 
-        #expect(write == .slugTaken(nil))
+        #expect(
+            write
+                == .slugTaken(
+                    detail: nil, advice: SteleError.Expectation.write.slugTakenAdvice
+                )
+        )
         #expect(admin == .nameTaken(nil))
         #expect(write.description.contains("--slug"))
+        // A publish *does* have the escape amend has not: no `--slug` at all, and the server
+        // allocates one. The advice says so, and this is the route it is true of.
+        #expect(write.description.contains("omit it and let the server generate one"))
         #expect(admin.description.contains("stele admin clients revoke"))
         // The specific mistake this split exists to make impossible.
         #expect(!admin.description.contains("--slug"))
+    }
+
+    /// The whole reason `Expectation.amend` exists rather than borrowing `write`'s. A `404` here
+    /// is most often a page that has *expired*, and `write`'s advice — "`stele update` never
+    /// creates a page, publish it first" — names the wrong command and, worse, leaves the obvious
+    /// next move looking like `--ttl never`, which fails identically because this verb cannot
+    /// revive anything.
+    @Test("a 404 from amend advises about amend rather than about update")
+    func amendNotFoundAdvice() async throws {
+        let error = try #require(
+            await amendFailure(status: 404, body: #"{"error":{"message":"No page there"}}"#)
+                as? SteleError
+        )
+        #expect(error.description.contains("stele amend"))
+        #expect(error.description.contains("never creates"))
+        #expect(!error.description.contains("stele update"))
+    }
+
+    /// The new name being held by another live page. It has to reach `slugTaken` rather than
+    /// `nameTaken` or an `unexpectedStatus`, because that case is what carries the exit code an
+    /// agent reads as "pick another name and retry" — the one outcome here that is worth
+    /// retrying at all.
+    ///
+    /// It carries *this* route's advice with it, and the second half of that is what the last
+    /// assertion is for. `publish`'s sentence ends "or omit it and let the server generate one",
+    /// which on an amendment is a dead end: omitting `--slug` asks for no rename, the server
+    /// allocates nothing, and an agent that follows it lands on the client-side "nothing to
+    /// amend" and exit 1 without a request ever leaving the process. Same status, same case, two
+    /// remedies — exactly the split `nameTaken` already exists for.
+    @Test("a 409 from amend is a taken slug, with advice amend can actually act on")
+    func amendConflictIsASlug() async throws {
+        let error = try #require(await amendFailure(status: 409, body: "") as? SteleError)
+        #expect(
+            error
+                == .slugTaken(
+                    detail: nil, advice: SteleError.Expectation.amend.slugTakenAdvice
+                )
+        )
+        #expect(error.description.contains("--slug"))
+        #expect(!error.description.contains("omit it and let the server generate one"))
     }
 
     /// A read has nothing unique on it for a `409` to be about, so this client says it has no
@@ -620,6 +877,12 @@ struct SteleErrorMappingTests {
         var seen: [SteleError] = []
         for status in [400, 401, 403, 404, 409, 413, 415, 426, 503, 500] {
             seen.append(try #require(SteleError.from(status: status, detail: nil, expectation: .write)))
+        }
+        // The two statuses that answer in the route's own words, taken from the other route that
+        // has any: advice is per-`Expectation`, so "every description names a next step" is a
+        // claim about each set of words and not about each case.
+        for status in [404, 409] {
+            seen.append(try #require(SteleError.from(status: status, detail: nil, expectation: .amend)))
         }
         seen.append(.transportFailure(host: try SteleHost("https://stele.example.com"), reason: "refused"))
         seen.append(.malformedResponse("not JSON"))

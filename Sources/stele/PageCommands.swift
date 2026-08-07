@@ -2,12 +2,18 @@ import ArgumentParser
 import Foundation
 import SteleKit
 
-/// What `publish` and `update` share: reading a file off disk and printing where it landed.
+/// What the three page-writing commands share: reading a file off disk, and printing where the
+/// page landed.
 ///
-/// Both commands are one API call around the same two chores, and both have exactly one line of
-/// output that a caller might capture, so the rules about *what goes on stdout* are worth
-/// stating once. The URL, alone, unstyled, is the whole of stdout on success — that is what
-/// makes `url=$(stele publish page.html)` work and what an agent will do with it.
+/// `publish` and `update` do both chores; `amend` does only the second, because it sends no
+/// bytes at all. What all three have in common is exactly one line of output a caller might
+/// capture, so the rules about *what goes on stdout* are worth stating once. The URL, alone,
+/// unstyled, is the whole of stdout on success — that is what makes
+/// `url=$(stele publish page.html)` work and what an agent will do with it.
+///
+/// `report` printing the *response's* URL rather than one assembled from the arguments is what
+/// makes it usable by `amend` at all: after a rename the address has changed, and the response
+/// is the only thing that knows what it changed to.
 enum PageIO {
     /// Reads the page, with an error that names the file rather than surfacing a Foundation
     /// description that begins "The file couldn't be opened".
@@ -148,9 +154,10 @@ struct UpdateCommand: SteleCommand {
             quietly publishing at a URL nobody has seen. Publish it with `stele publish --slug \
             <name>` first if that is what you meant.
 
-            There is no --ttl here. A page's lifetime is fixed when it is published, so \
-            replacing the body cannot buy the link more time; the deadline it already has is \
-            printed under the URL. Republish it if you need a different one.
+            There is no --ttl here, deliberately: replacing a body cannot buy the link more \
+            time, and a lifetime quietly reset by every edit would be a deadline nobody could \
+            predict. The deadline the page already has is printed under the URL, unchanged. \
+            `stele amend --ttl` is how you move it, without touching the contents.
             """
     )
 
@@ -181,6 +188,104 @@ struct UpdateCommand: SteleCommand {
             contentType: contentType ?? ContentType.inferred(fromPath: file),
             using: credential
         )
+        try PageIO.report(location, options: options)
+    }
+}
+
+struct AmendCommand: SteleCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "amend",
+        abstract: "Rename a page or change its deadline. Prints the URL.",
+        discussion: """
+            Amends a page's name, its deadline, or both, and nothing else. The contents, the \
+            content type and the record of who published them survive untouched — an amendment \
+            writes no bytes, so it does not claim to have written them.
+
+            Omitting --ttl leaves the existing deadline exactly where it is; it does not \
+            reapply the default lifetime a new page would get. Passing one counts from now \
+            rather than from publication, so --ttl 30 grants thirty fresh days rather than \
+            whatever is left of the original thirty.
+
+            A rename is a hard move. The old name is freed the moment it commits — it serves an \
+            ordinary 404 and returns to the pool for anybody's next page to claim, with no \
+            redirect and no tombstone left behind. Every link already in circulation breaks. If \
+            the URL is already out in the world and what you want is for it to say something \
+            else, that is `stele update`.
+
+            Never creates and never revives: amending a slug with no live page behind it exits \
+            7, and a page that has already expired counts as none, so --ttl never cannot bring \
+            one back. Exits 5 if the name you asked for is held by another page.
+
+            The URL on stdout is the page's URL after the amendment, which may not be the one \
+            you passed in. Read it from here rather than assembling it yourself.
+            """
+    )
+
+    @OptionGroup var options: GlobalOptions
+
+    @Argument(help: ArgumentHelp("The page to amend, as its slug appears in the URL.", valueName: "slug"))
+    var slug: String
+
+    /// The new name, spelled `--slug` on the command line to match `publish --slug`, but held in
+    /// a differently named property because the positional above has already taken `slug`. The
+    /// flag is the part users and agents type, so it is the part that stays consistent.
+    @Option(
+        name: .customLong("slug"),
+        help: ArgumentHelp(
+            "Rename the page to this slug.",
+            discussion: """
+                Lowercase letters, digits and hyphens; the server has the last word. Renaming a \
+                page to the name it already has succeeds and changes nothing.
+                """,
+            valueName: "name"
+        )
+    )
+    var newSlug: String?
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Give the page a new lifetime: a number of days, or 'never'.",
+            discussion: """
+                30 and 30d both mean thirty days; 2w means fourteen. Counted from now rather \
+                than from when the page was published, so 30 grants thirty fresh days. Omit it \
+                and the deadline the page already has is left alone — unlike `publish`, this is \
+                not a way to fall back to the default lifetime. The server has the last word on \
+                the maximum.
+                """,
+            valueName: "days"
+        ),
+        completion: .list([PageTTL.neverKeyword, "7", "30", "90"])
+    )
+    var ttl: String?
+
+    func execute() async throws {
+        // Refused here, before a credential is read or a byte is sent. The server answers this
+        // with a 400 of its own, but an amendment naming nothing to amend is a mistake in the
+        // invocation rather than a disagreement with the server, and this side can name the two
+        // flags that would fix it — the same bargain `PageIO.read` strikes over an empty file.
+        guard newSlug != nil || ttl != nil else {
+            throw Failure("""
+                nothing to amend — pass --slug <name> to rename the page, --ttl <days> to change \
+                its deadline, or both.
+                """)
+        }
+        // Parsed before the request rather than after, for `publish`'s reason: a lifetime this
+        // side can already tell is unusable should not cost a round trip. Note that it stays nil
+        // when --ttl was not given, and must — a defaulted value here would put a deadline on a
+        // page the caller only asked to rename.
+        let lifetime = try ttl.map { raw -> PageTTL in
+            do { return try PageTTL.parse(raw) } catch { throw Failure("\(error)") }
+        }
+        let credential = try options.credential()
+        let location = try await SteleClient(credential: credential).amend(
+            slug: slug,
+            newSlug: newSlug,
+            ttl: lifetime,
+            using: credential
+        )
+        // The usual report, and it matters more here than anywhere else: after a rename the
+        // response is the only thing that knows where the page now lives.
         try PageIO.report(location, options: options)
     }
 }
