@@ -44,8 +44,9 @@ enum Exit {
     /// or nothing does.
     static let pageRejected: Int32 = 6
 
-    /// `404` — an update to a slug that does not exist, an amendment to one with no live page
-    /// behind it (a page that has expired counts as none), or an unknown client name.
+    /// `404` — an update to a slug that does not exist, an amendment or a deletion aimed at one
+    /// with no live page behind it (a page that has expired counts as none), or an unknown
+    /// client name.
     static let notFound: Int32 = 7
 
     /// `426` — this build is older than the server requires. Uniquely recoverable without

@@ -58,6 +58,7 @@ unpublished, and a caller handed only a URL would find that out when the link br
 | `stele publish <file> [--slug <name>] [--ttl <days>]` | agent | `POST /pages`. Prints the URL on stdout and the page's deadline on stderr. |
 | `stele update <slug> <file>` | agent | `PUT /pages/:slug`. Never creates, and never changes the deadline. |
 | `stele amend <slug> [--slug <name>] [--ttl <days>]` | agent | `PATCH /pages/:slug`. Renames a page, moves its deadline, or both, without touching a byte of it. A rename is a hard move — the old URL starts 404ing at once. |
+| `stele delete <slug>` | agent | `DELETE /pages/:slug`. Permanent and immediate — the slug is freed and returns to the pool, so every link to it breaks. Prints nothing on stdout; the confirmation is on stderr. |
 | `stele skill` | agent | Proxies `GET /skill`, so the binary keeps zero copies of the contract. |
 | `stele admin clients create <name>` | operator | Mints a credential and prints the token **once**. `--scopes`, `--expires-in 90d`. |
 | `stele admin clients list` | operator | Names, scopes, last use, revocation state. |
