@@ -293,6 +293,46 @@ struct SteleClientRequestTests {
         #expect(location.url == "https://stele.example.com/server-settled-on-this")
     }
 
+    /// A delete's request is mostly absences, and each one is a decision. No query: this route has
+    /// no parameters at all, and one the server does not know is silence rather than a `400`. No
+    /// body and no content type: the server reads neither, so a `Content-Type` here would be a
+    /// claim about bytes that are not being sent.
+    @Test("delete DELETEs the slug's own path and sends nothing with it")
+    func delete() async throws {
+        let transport = FakeTransport(status: 204, body: "")
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        try await client.delete(slug: "quiet-cedar-otter", using: credential)
+
+        let request = try #require(await transport.last)
+        #expect(request.method == "DELETE")
+        #expect(request.url.absoluteString == "https://stele.example.com/pages/quiet-cedar-otter")
+        #expect(request.url.query == nil)
+        #expect(request.body == nil)
+        #expect(request.contentType == nil)
+        #expect(request.headerFields()["Content-Type"] == nil)
+        // Behind the bearer token like every other write on /pages — a delete is not a read.
+        #expect(request.headerFields()["Authorization"] == "Bearer stele_pat_test")
+    }
+
+    /// The reason `delete` does not go through the generic `send` helper, pinned. Success on this
+    /// route is a `204` with no body — the server strips `Content-Length` too — and `send` decodes
+    /// the body unconditionally, so a delete routed through it would fail on every success with a
+    /// `malformedResponse` about zero bytes. Nothing downstream could tell that apart from a real
+    /// server problem, and by then the page is actually gone: the caller would be told the delete
+    /// went wrong about a delete that worked.
+    @Test("a 204 with an empty body is a success, not a decoding failure")
+    func deleteAcceptsAnEmptyBody() async throws {
+        let transport = FakeTransport(status: 204, body: "")
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        try await client.delete(slug: "quiet-cedar-otter", using: credential)
+
+        #expect(await transport.requests.count == 1)
+    }
+
     /// The *other* surface a slug arrives on, and it is protected by something different from
     /// the path segment's percent-encoding. A query value is not a path: dot-segment removal
     /// never looks at it, so `../admin/clients` stays a string sitting in `?slug=`, unresolved,
@@ -348,6 +388,36 @@ struct SteleClientRequestTests {
         #expect(request.url.absoluteString == expected)
         // The property the escapes above are only instances of: whatever was typed, the request
         // is still for something under /pages.
+        #expect(request.url.standardized.path.hasPrefix("/pages/"))
+    }
+
+    /// The same rule on the verb that is already destructive, which is what makes a stray path
+    /// segment worth catching here twice over: dot segments are removed before the request leaves,
+    /// so `delete ../admin/clients/claude-code` raw is `DELETE /admin/clients/claude-code` — a
+    /// page command revoking a credential. Encoded, the whole thing stays one segment and comes
+    /// back as the server's `400` naming the rule the slug broke.
+    @Test(
+        "a deleted slug cannot climb out of /pages",
+        arguments: [
+            (
+                "../admin/clients/claude-code",
+                "https://stele.example.com/pages/..%2Fadmin%2Fclients%2Fclaude-code"
+            ),
+            ("..", "https://stele.example.com/pages/%2E%2E"),
+            (".", "https://stele.example.com/pages/%2E"),
+            ("a/b", "https://stele.example.com/pages/a%2Fb"),
+            ("quiet-cedar-otter", "https://stele.example.com/pages/quiet-cedar-otter"),
+        ]
+    )
+    func deletedSlugStaysOneSegment(_ slug: String, _ expected: String) async throws {
+        let transport = FakeTransport(status: 204, body: "")
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        try await client.delete(slug: slug, using: credential)
+
+        let request = try #require(await transport.last)
+        #expect(request.url.absoluteString == expected)
         #expect(request.url.standardized.path.hasPrefix("/pages/"))
     }
 
@@ -711,6 +781,23 @@ struct SteleErrorMappingTests {
         }
     }
 
+    /// The same round trip through `delete`, and it exists for `amendFailure`'s reason: the thing
+    /// worth asserting is the advice this *route* produces, since the mistake being guarded
+    /// against is the call site handing `perform` the wrong `Expectation` — which no amount of
+    /// testing `Expectation.delete` on its own would catch.
+    private func deleteFailure(status: Int, body: String = "") async -> (any Error)? {
+        do {
+            let credential = try testCredential()
+            let client = SteleClient(
+                credential: credential, transport: FakeTransport(status: status, body: body)
+            )
+            try await client.delete(slug: "quiet-cedar-otter", using: credential)
+            return nil
+        } catch {
+            return error
+        }
+    }
+
     /// One case per outcome the caller reacts to differently, and every description ends in an
     /// instruction — the reader is an agent deciding whether to retry, fix the input, or stop.
     @Test(
@@ -856,6 +943,43 @@ struct SteleErrorMappingTests {
         )
         #expect(error.description.contains("--slug"))
         #expect(!error.description.contains("omit it and let the server generate one"))
+    }
+
+    /// Why `Expectation.delete` exists rather than reusing `write`'s. That advice names
+    /// `stele update` and tells the reader to publish the page first — on a delete that is not the
+    /// wrong command so much as the reverse instruction, and an agent obeying it would recreate
+    /// the page it had just been asked to remove, ending the run with the page live and nothing
+    /// looking like a failure. The truth here is duller and needs no next command: the page is
+    /// already gone, expired or deleted earlier, and the server would rather say so than claim a
+    /// deletion it never performed.
+    @Test("a 404 from delete says the page is already gone rather than to publish it")
+    func deleteNotFoundAdvice() async throws {
+        let error = try #require(
+            await deleteFailure(status: 404, body: #"{"error":{"message":"No page there"}}"#)
+                as? SteleError
+        )
+        #expect(
+            error
+                == .notFound(
+                    detail: "No page there", advice: SteleError.Expectation.delete.notFoundAdvice
+                )
+        )
+        #expect(error.description.contains("nothing left to delete"))
+        #expect(!error.description.contains("stele update"))
+        #expect(!error.description.contains("stele publish"))
+    }
+
+    /// The scope named in a `403` comes off the route's `Expectation`, and a delete is a write on
+    /// `/pages` like the rest — `publish`, not `admin`. Naming the wrong one sends an agent whose
+    /// credential is perfectly good hunting for an operator token it will never be given.
+    @Test("a 403 from delete names the publish scope")
+    func deleteForbiddenScope() async throws {
+        let error = try #require(
+            await deleteFailure(status: 403, body: #"{"error":{"message":"Missing scope"}}"#)
+                as? SteleError
+        )
+        #expect(error == .forbidden(missing: .publish, detail: "Missing scope"))
+        #expect(error.description.contains("`publish` scope"))
     }
 
     /// A read has nothing unique on it for a `409` to be about, so this client says it has no

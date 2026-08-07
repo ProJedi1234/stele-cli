@@ -6,7 +6,8 @@ import SteleKit
 /// page landed.
 ///
 /// `publish` and `update` do both chores; `amend` does only the second, because it sends no
-/// bytes at all. What all three have in common is exactly one line of output a caller might
+/// bytes at all. `delete` does neither and is not routed through here at all — it ends with no
+/// page to point at. What all three have in common is exactly one line of output a caller might
 /// capture, so the rules about *what goes on stdout* are worth stating once. The URL, alone,
 /// unstyled, is the whole of stdout on success — that is what makes
 /// `url=$(stele publish page.html)` work and what an agent will do with it.
@@ -287,6 +288,56 @@ struct AmendCommand: SteleCommand {
         // The usual report, and it matters more here than anywhere else: after a rename the
         // response is the only thing that knows where the page now lives.
         try PageIO.report(location, options: options)
+    }
+}
+
+struct DeleteCommand: SteleCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "delete",
+        abstract: "Delete a published page. Prints nothing.",
+        discussion: """
+            Permanent and immediate. No tombstone, no redirect: the slug is freed the moment it \
+            commits and returns to the pool for anybody's next page to claim. Every link already \
+            in circulation breaks as an ordinary 404 — and may one day answer with somebody \
+            else's page, which is the part worth saying out loud before you type this. \
+            Republishing the same file afterwards is a new page, not the old one back.
+
+            Never a silent success: deleting a slug with no live page behind it exits 7, and a \
+            page that has already expired counts as none. The server refuses to claim work it \
+            never did, so a typo'd slug is an error you can branch on rather than a 0 that means \
+            nothing happened.
+
+            Stdout stays empty on success, deliberately. The other page commands print a URL \
+            because there is a page to point at; here there is not. The confirmation goes to \
+            stderr, and --json prints the slug on stdout for a caller that needs to tie the \
+            outcome back to the request.
+            """
+    )
+
+    @OptionGroup var options: GlobalOptions
+
+    @Argument(help: ArgumentHelp("The page to delete, as its slug appears in the URL.", valueName: "slug"))
+    var slug: String
+
+    func execute() async throws {
+        let credential = try options.credential()
+        // The route needs only `publish`, so this is the agent's own credential and not an
+        // operator's — deleting a page is part of publishing one, not an administrative act.
+        try await SteleClient(credential: credential).delete(slug: slug, using: credential)
+        if options.json {
+            // The slug echoed back rather than an empty object: the page is gone, so there is
+            // nothing left for a caller batching deletes to match this result against except
+            // the name it asked for.
+            Terminal.out(try Format.json(["slug": slug]))
+            return
+        }
+        // Nothing goes to stdout here, and the emptiness is the contract. Every other page
+        // command's stdout is a URL, which is why `url=$(stele publish page.html)` works —
+        // a confirmation line printed on this one would be captured by the same idiom and
+        // handed onward as if it were an address. So the only thing said on success is said on
+        // stderr, where `PageIO` already puts the deadline: legible to a human watching, absent
+        // from anything reading.
+        Terminal.error(options.style.dim("deleted \(slug)"))
     }
 }
 

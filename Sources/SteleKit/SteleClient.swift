@@ -238,6 +238,42 @@ public struct SteleClient: Sendable {
         )
     }
 
+    /// `DELETE /pages/:slug`. Takes a page down, and answers with nothing at all.
+    ///
+    /// The one write here that does not go through `send`, and it cannot: success is a `204` with
+    /// no body — the server strips even `Content-Length` — while `send` hands whatever came back
+    /// to a `JSONDecoder` unconditionally. Routed through it, every *successful* delete would
+    /// surface as a `malformedResponse` complaining about zero bytes, with the page genuinely
+    /// gone by then and the caller told the server had answered strangely. So this calls
+    /// `perform` directly, the way `fetchSkill` does, and discards the response. There is nothing
+    /// in it to read.
+    ///
+    /// Deletion is permanent and immediate: no tombstone, no redirect, and the slug goes straight
+    /// back into the pool for anybody's next page. That is the same hard move a rename makes, and
+    /// it costs the same — links already in circulation break as a plain `404` at first, and then,
+    /// once someone else is allocated the name, as links that quietly point at their page instead.
+    ///
+    /// A `404` means the page was already gone, and an expired-but-unreclaimed page counts as gone
+    /// here exactly as it does for `update` and `amend`. It is reported rather than swallowed: the
+    /// server declines to claim a deletion it did not perform, and this method does not soften
+    /// that into success on its behalf.
+    public func delete(slug: String, using credential: Credential) async throws {
+        // `credential.host`, deliberately — see the type's documentation. Every other
+        // authenticated call inherits that rule from `send`; this one, bypassing it, has to keep
+        // the rule itself.
+        let target = credential.host
+        _ = try await perform(
+            SteleRequest(
+                method: "DELETE",
+                url: try url(path: Path.page(slug: slug), on: target),
+                credential: credential,
+                timeout: timeout
+            ),
+            host: target,
+            expectation: .delete
+        )
+    }
+
     /// `GET /skill` — the server's own instructions for publishing to it, as Markdown.
     ///
     /// Unauthenticated, like every other read on this server, and returned as text rather than

@@ -242,6 +242,26 @@ extension SteleError {
                 allocates one of its own.
                 """)
         )
+        /// The third `publish`-scoped write, and the third route that cannot take `write`'s `404`
+        /// as it stands. That one names `stele update` and tells the reader to publish the page
+        /// first, which here is not merely the wrong command but the opposite instruction: an
+        /// agent following it would recreate the very page it was asked to remove, and the run
+        /// would end with the page live and nothing reading as a failure. What a `404` on a delete
+        /// actually reports is that the work is already done — the page expired, or an earlier
+        /// delete took it — so the advice names no follow-up command, because there is none to
+        /// name. Its whole job is to stop the reader treating "already gone" as a problem of
+        /// theirs to fix. The `409` is `.none` for the plainer reason: this route asks for no
+        /// name, so there is nothing on it for a conflict to be about.
+        static let delete = Expectation(
+            scope: .publish,
+            notFoundAdvice: """
+                Nothing is published at that slug — it may have expired, or it may already have \
+                been deleted. Either way the page is gone and there is nothing left to delete: \
+                the server refuses to claim work it never did rather than answering yes to a \
+                page it does not have. If you expected one there, the slug is the thing to check.
+                """,
+            conflict: .none
+        )
         static let administration = Expectation(
             scope: .admin,
             notFoundAdvice: "Check the name against `stele admin clients list`.",
