@@ -35,14 +35,17 @@ enum Exit {
     static let forbidden: Int32 = 4
 
     /// `409` — the requested slug is taken. The one failure with an obvious programmatic
-    /// remedy: choose another `--slug`, or drop it and let the server allocate.
+    /// remedy: ask for a different `--slug`. On `publish` it can also be dropped, and the server
+    /// allocates one; on `amend` it cannot, because dropping it there means "do not rename" —
+    /// which is why the message carries the route's own advice and this table does not repeat it.
     static let slugTaken: Int32 = 5
 
     /// `413` / `415` — the page itself is the problem. Retrying is pointless; the input changes
     /// or nothing does.
     static let pageRejected: Int32 = 6
 
-    /// `404` — an update to a slug that does not exist, or an unknown client name.
+    /// `404` — an update to a slug that does not exist, an amendment to one with no live page
+    /// behind it (a page that has expired counts as none), or an unknown client name.
     static let notFound: Int32 = 7
 
     /// `426` — this build is older than the server requires. Uniquely recoverable without
@@ -65,7 +68,7 @@ enum Exit {
             (noCredential, "no usable credential here — ask the user to run `stele auth login`"),
             (credentialRejected, "the server rejected the credential — ask the user to log in again"),
             (forbidden, "valid credential, insufficient scope — an operator has to run this"),
-            (slugTaken, "that slug is taken — choose another --slug or omit it"),
+            (slugTaken, "that slug is taken — ask for a different --slug"),
             (pageRejected, "the page is too large or the wrong type"),
             (notFound, "no such page or client"),
             (upgradeRequired, "the CLI is too old — reinstall it and retry once"),

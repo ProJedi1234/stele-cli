@@ -1,6 +1,7 @@
 import Foundation
 
-/// Where a published page lives — the body both writes answer with.
+/// Where a published page lives — the body every write answers with: `publish`, `update` and
+/// `amend` alike.
 ///
 /// `url` is the server's own rendering rather than something assembled here from the host and
 /// the slug. The deployment knows its public base URL and this client only knows the address
@@ -12,9 +13,14 @@ public struct PageLocation: Codable, Sendable, Equatable {
     /// When the page stops being served, or nil for one that is kept until it is deleted.
     ///
     /// Reading this rather than computing it from the `--ttl` that was sent is the point: the
-    /// server resolves the deadline against *its* clock at the moment of the upload, it applies
-    /// its own default when the caller expressed no opinion, and on `update` it reports the
-    /// deadline the page already had — a number this side never knew.
+    /// server resolves the deadline against *its* clock at the moment of the request, on
+    /// `publish` it applies its own default when the caller expressed no opinion, and on
+    /// `update` it reports the deadline the page already had — a number this side never knew.
+    ///
+    /// `amend` is the one that reads a silent caller the other way round: with no `?ttl=` it
+    /// touches nothing and reports the deadline already in force, and with one it reports a
+    /// deadline counted from *now* rather than from publication. Either way the answer is here
+    /// and nowhere else, which is exactly why no caller should be computing it.
     ///
     /// Nil covers two wire shapes, and they mean the same thing. The server sends an explicit
     /// `null` for a permanent page; a deployment older than page expiry omits the key, and on
@@ -116,7 +122,9 @@ public struct ClientSummary: Codable, Sendable, Equatable {
 /// exists so a command can ask "does this credential have `admin`?" without a bare string
 /// literal at the call site, and so the wording in a 403 can name the scope that was missing.
 public enum Scope: String, Codable, Sendable, CaseIterable {
-    /// What every agent credential gets, and all it gets: `POST /pages` and `PUT /pages/:slug`.
+    /// What every agent credential gets, and all it gets: `POST /pages`, `PUT /pages/:slug` and
+    /// `PATCH /pages/:slug` — write, replace, and rename-or-retime. An amendment is a write like
+    /// the other two, so it sits under this scope and not behind `admin`.
     case publish
     /// The operator's scope: minting, listing and revoking credentials.
     case admin

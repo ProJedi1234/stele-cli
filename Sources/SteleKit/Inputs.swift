@@ -125,13 +125,20 @@ public enum ExpiryDuration {
     }
 }
 
-/// How long a published page lives, as the `?ttl=` value `POST /pages` wants.
+/// How long a page lives, as the `?ttl=` value `POST /pages` and `PATCH /pages/:slug` want.
 ///
 /// The server measures a page's life in whole days or not at all: `?ttl=30`, or `?ttl=never`.
-/// Omitting it is a third thing — the server's own default, seven days — and that default is
-/// deliberately not repeated here. A CLI that printed "expires in 7 days" from a constant would
-/// keep printing it the day the server changed its mind, and the server tells us the real answer
-/// in the response body anyway.
+/// Omitting it is a third thing — and this is the trap, because it is not the *same* third thing
+/// on both routes. On `POST` an absent `?ttl=` takes the server's own default lifetime, a matter
+/// of days; on `PATCH` it means **leave the deadline exactly where it is**. `PageTTL?` cannot
+/// carry that difference — it is one optional with one absent case, read in opposite directions
+/// by the two verbs — so it rests entirely on neither caller inventing a value to fill the
+/// silence with. A `ttl=7` sent on an amendment because seven looked like a reasonable default
+/// would put a week's deadline on a page published to be kept, and the `200` would look right.
+///
+/// The default itself is deliberately not repeated here. A CLI that printed "expires in 7 days"
+/// from a constant would keep printing it the day the server changed its mind, and the server
+/// tells us the real answer in the response body anyway.
 ///
 /// Note what this type does *not* do: it has no maximum. The server's `PageLifetime` owns that
 /// bound, for the same reason its `Slug` owns the slug rules — a copy here would be a second

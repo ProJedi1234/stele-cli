@@ -28,6 +28,10 @@ $ stele update q3-report report.html
 https://stele.example.com/q3-report
 kept until deleted
 
+$ stele amend q3-report --slug q3-final
+https://stele.example.com/q3-final
+kept until deleted
+
 $ stele auth status
 host       https://stele.example.com
 client     claude-code
@@ -53,6 +57,7 @@ unpublished, and a caller handed only a URL would find that out when the link br
 | `stele auth logout` | human | Forgets the local credential. Does not revoke it. |
 | `stele publish <file> [--slug <name>] [--ttl <days>]` | agent | `POST /pages`. Prints the URL on stdout and the page's deadline on stderr. |
 | `stele update <slug> <file>` | agent | `PUT /pages/:slug`. Never creates, and never changes the deadline. |
+| `stele amend <slug> [--slug <name>] [--ttl <days>]` | agent | `PATCH /pages/:slug`. Renames a page, moves its deadline, or both, without touching a byte of it. A rename is a hard move — the old URL starts 404ing at once. |
 | `stele skill` | agent | Proxies `GET /skill`, so the binary keeps zero copies of the contract. |
 | `stele admin clients create <name>` | operator | Mints a credential and prints the token **once**. `--scopes`, `--expires-in 90d`. |
 | `stele admin clients list` | operator | Names, scopes, last use, revocation state. |
@@ -122,7 +127,7 @@ Pages are ephemeral by default. `--ttl` says otherwise:
 
 | `--ttl` | Means |
 | --- | --- |
-| omitted | the server's default lifetime, which is a matter of days |
+| omitted | on `publish`, the server's default lifetime, a matter of days; on `amend`, the deadline already in force |
 | `30`, `30d` | thirty days |
 | `2w` | fourteen days |
 | `never` | kept until you delete it |
@@ -139,13 +144,52 @@ would be a second source of truth that drifts silently the day the server moves 
 `400` it earns names the real limit. What this side checks is only what the server cannot: that
 you wrote something meaning a number of days, and that turning it into one does not overflow.
 
-A page's deadline is fixed when it is published. `stele update` has no `--ttl` — replacing a
-page's body cannot buy the link another week — and the server answers `?ttl=` on `PUT` with a
-`400` rather than a `200` that silently ignored it. Republish if you need a different lifetime.
+A deadline is fixed for a page's *body*, not for the page. `stele update` still has no `--ttl` —
+replacing a body cannot buy the link another week, and a lifetime quietly reset by every edit
+would be a deadline nobody could predict — and the server still answers `?ttl=` on `PUT` with a
+`400` rather than a `200` that silently ignored it. That refusal is not a gap waiting to be
+filled; it is the rule that a replacement cannot retime a page. Moving a deadline is a separate
+act, and `stele amend --ttl` is the one thing that performs it.
+
+Two things about it want knowing before you type it. An omitted `--ttl` on `amend` means *leave
+the deadline exactly where it is* — not "apply the default", which is what omitting it on
+`publish` means. The two commands read the same absence in opposite directions deliberately, and
+the direction here is the safe one: the alternative is a `--slug` rename that also, silently,
+puts a week's deadline on a page somebody published to keep. And the lifetime you do pass is
+counted from the moment of the request rather than from publication, so `--ttl 30` on a page
+published three weeks ago grants thirty fresh days rather than the nine that were left of them.
+It is a new lease, not an adjustment to the old one.
 
 The deadline itself is always read off the response, never computed here: the server resolves it
 against *its* clock at the moment of the upload, applies its own default when you say nothing,
-and on `update` reports the deadline the page already had — a date this side never knew.
+and on `update` reports the deadline the page already had — a date this side never knew. `amend`
+is no different: what comes back is the deadline now in force, whether you moved it or left it
+alone, and it is the only honest answer to what happened, because only the server's clock knows
+when "thirty days from now" lands.
+
+## What a rename costs
+
+A lifetime is one way a link you handed somebody stops working. `stele amend --slug` is the
+other, and it is the faster one, so it gets said plainly: a rename is a hard move. The old name
+is freed the instant the rename commits. There is no redirect, no tombstone, nothing recording
+that the page was ever called that — the old URL begins serving the ordinary `404`, the same
+bytes a slug nobody has ever used gets, and the name goes straight back in the pool for the next
+`--slug` anybody asks for. A rename is not a forwarding address. It is a deletion and a
+publication that happen to preserve the contents.
+
+Which makes the question to ask beforehand not "would a better name be nice" but "who already
+has the old one". A URL that has not left your terminal renames freely, and that is the case
+`amend` is for: the generated three-word slug you have decided to replace before sending it
+anywhere. A URL already sitting in somebody's inbox is a different matter — renaming it breaks
+it for them, with no notice and no trail back. The tool for changing what a circulated link says
+is `stele update`, which replaces the contents and leaves the address alone. That is the whole
+division of labour between the two: `update` keeps the URL and replaces the page, `amend` keeps
+the page and replaces the URL.
+
+Everything an amendment is not asked to change survives it, including the record of which
+credential published the page. That is deliberate rather than an oversight: the column names who
+wrote the bytes, and an amendment writes none — so renaming somebody's page cannot make it look
+like yours.
 
 ## Exit codes
 
@@ -160,7 +204,7 @@ table.
 | 2 | no usable credential here — ask the user to run `stele auth login` |
 | 3 | the server rejected the credential — ask the user to log in again |
 | 4 | valid credential, insufficient scope — an operator has to run this |
-| 5 | that slug is taken — choose another `--slug` or omit it |
+| 5 | that slug is taken — ask for a different `--slug` |
 | 6 | the page is too large or the wrong type |
 | 7 | no such page or client |
 | 8 | the CLI is too old — reinstall it and retry once |
@@ -174,6 +218,12 @@ it and let the server generate one.
 $ echo $?
 5
 ```
+
+The message carries the remedy the *route* has, which is why the table above does not. Dropping
+`--slug` is an escape `publish` offers and `amend` does not: there it means "do not rename", the
+server allocates nothing, and an amendment asking for neither a name nor a deadline is refused
+before it is sent. A 5 from `stele amend` means pick a different name or leave the page where it
+is.
 
 Code 8 is the version gate: the CLI sends `User-Agent: stele-cli/<version>` on every request and
 a server whose `minimumCLIVersion` is higher answers `426`. The remedy is printed with the
@@ -351,10 +401,21 @@ mint the first client. Arguments may also arrive as `STELE_SMOKE_HOST`, `STELE_S
 | `--psql <command>` | optional | A command that reaches the server's database, e.g. `docker exec stele-postgres psql -U stele -d stele_smoke`. Only the attribution check needs it, because no route reports who wrote a page — without it that one check prints `skip`. |
 
 It walks the whole documented lifecycle — mint, log in, `auth status`, publish, fetch the bytes
-back and compare them, update, `--expires-in` there *and* back, expiry actually enforced, a
-publish-only credential answered `200` by whoami and `403` by the admin routes, revocation that
+back and compare them, update, amend, `--expires-in` there *and* back, expiry actually enforced,
+a publish-only credential answered `200` by whoami and `403` by the admin routes, revocation that
 really stops working, the exit-code vocabulary, the version gate, and the byte-identity of every
 `404`. It prints each check, stops at the first failure, and exits non-zero.
+
+The amend leg is the one worth naming, because most of what it asserts cannot be seen from
+inside this repository: that a rename really does free the old name at once — the old URL 404s
+in the same breath, and the name is claimable again — that the contents and the content type
+come through the move untouched, and above all that a rename with no `--ttl` leaves the deadline
+exactly where it was. That last check is run against a page published `--ttl never`, so a client
+that helpfully sent a default lifetime would show up as a permanent page with a week to live.
+It also pins the refusals: exit 5 for a name another live page holds, exit 7 for a slug with no
+live page behind it, and exit 1 for an amendment that named nothing to amend — that one with the
+credential file moved aside, which is how the script proves the refusal happened before anything
+was sent.
 
 Two things it does not do, stated because a canary you trust wrongly is worse than none:
 
@@ -362,9 +423,13 @@ Two things it does not do, stated because a canary you trust wrongly is worse th
   refuses a pipe; the script asserts the *refusal* — which is the load-bearing custody rule — and
   then seeds the credential file at `0600` in the documented format for the rest of the run. The
   prompt, the echo-off read and the verify-before-write are not covered.
-- **It leaves litter.** The server has no delete route, so each run leaves two pages and three
+- **It leaves litter.** The server has a delete route but this CLI ships no command that reaches
+  it, so each run leaves eight pages and three
   credential rows behind; it revokes every credential it mints, but a revoked row is still a row.
-  Run it against a throwaway deployment, never against production.
+  Five of those pages expire on their own — the lifetime checks publish several deliberately —
+  but three were published or amended to `--ttl never` and will still be there next year. The
+  footer names those three, since they are the only ones a human ever has to clean up. Run it
+  against a throwaway deployment, never against production.
 
 It also moves `~/.config/stele/credentials.json` aside and restores it on every exit path,
 including a failed check — see the `HOME` note under Configuration for why it cannot simply use a

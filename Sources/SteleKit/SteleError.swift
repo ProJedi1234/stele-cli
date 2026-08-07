@@ -22,17 +22,25 @@ public enum SteleError: Error, Equatable, CustomStringConvertible {
     case unauthorized
     /// `403` — a valid credential without the scope this operation needs.
     case forbidden(missing: Scope?, detail: String?)
-    /// `404` — a PUT to a slug that does not exist, or an unknown client name. The advice
-    /// comes from the caller, because those two have nothing useful in common to say.
+    /// `404` — a PUT to a slug that does not exist, a PATCH to one with no live page behind it
+    /// (an expired page counts as none), or an unknown client name. The advice comes from the
+    /// caller, because those three have nothing useful in common to say.
     case notFound(detail: String?, advice: String)
     /// `409` on a write — the requested slug is taken.
-    case slugTaken(String?)
+    ///
+    /// The advice comes from the caller for the same reason `notFound`'s does, and it was the
+    /// same mistake found twice: "omit `--slug` and let the server generate one" is the right
+    /// next move on a `publish` and a false one on an `amend`, where omitting `--slug` means
+    /// *do not rename* and no slug is ever allocated. An agent that took that branch would come
+    /// back with a client-side "nothing to amend" and never reach the server at all.
+    case slugTaken(detail: String?, advice: String)
     /// `409` on an admin route — a live credential already holds that name.
     ///
     /// Split from `slugTaken` rather than sharing it, because a `409` means two unrelated things
-    /// on this server and the remedies have nothing in common: one is "choose another `--slug`",
-    /// and the other is "revoke the credential holding the name, or pick a different one". A
-    /// single case answered `admin clients create` by naming a flag that command does not have.
+    /// on this server and the remedies have nothing in common: one is about the name a *page*
+    /// wanted, and the other is "revoke the credential holding the name, or pick a different
+    /// one". A single case answered `admin clients create` by naming a flag that command does
+    /// not have.
     case nameTaken(String?)
     /// `413` — the page is over the server's byte limit.
     case pageTooLarge(String?)
@@ -79,11 +87,8 @@ public enum SteleError: Error, Equatable, CustomStringConvertible {
                 """
         case .notFound(let detail, let advice):
             return "the server has nothing there\(Self.suffix(detail)) \(advice)"
-        case .slugTaken(let detail):
-            return """
-                that slug is already taken\(Self.suffix(detail)) Choose another `--slug`, or \
-                omit it and let the server generate one.
-                """
+        case .slugTaken(let detail, let advice):
+            return "that slug is already taken\(Self.suffix(detail)) \(advice)"
         case .nameTaken(let detail):
             return """
                 a live credential already has that name\(Self.suffix(detail)) Choose another \
@@ -179,7 +184,11 @@ extension SteleError {
         /// route knows about itself: `/pages` has slugs, `/admin/clients` has names, and a read
         /// has neither and should say so rather than pick one.
         enum Conflict: Sendable {
-            case slug
+            /// A route where a slug is what collided, carrying what *this* route's caller can
+            /// do about it. Two routes ask for a slug and they do not have the same escape: one
+            /// can drop `--slug` and take whatever the server allocates, and the other cannot,
+            /// because there dropping it means asking for no rename at all.
+            case slug(advice: String)
             case name
             /// A route with nothing unique on it. A `409` here is a genuine surprise, and
             /// `unexpectedStatus` says exactly that instead of inventing advice.
@@ -187,7 +196,7 @@ extension SteleError {
 
             func error(_ detail: String?) -> SteleError {
                 switch self {
-                case .slug: return .slugTaken(detail)
+                case .slug(let advice): return .slugTaken(detail: detail, advice: advice)
                 case .name: return .nameTaken(detail)
                 case .none: return .unexpectedStatus(code: 409, detail: detail)
                 }
@@ -206,7 +215,32 @@ extension SteleError {
             notFoundAdvice: """
                 `stele update` never creates a page — publish it with `stele publish` first.
                 """,
-            conflict: .slug
+            conflict: .slug(advice: """
+                Choose another `--slug`, or omit it and let the server generate one.
+                """)
+        )
+        /// A write too, and still `publish`-scoped, but it can borrow neither half of `write`'s
+        /// advice. The `404`: that one names `stele update` and tells the reader to publish the
+        /// page first, which is true of a replacement and misleading here — the `404` an
+        /// amendment earns is usually a page that has *expired*, and the thing the reader has to
+        /// be told is that this verb neither creates nor revives, otherwise the obvious next move
+        /// is `--ttl never`, which will fail exactly the same way. The `409`: `publish`'s
+        /// "omit it and let the server generate one" is an escape this route does not have.
+        /// Omitting `--slug` on an amendment is not a request for any other name, it is a request
+        /// for no rename — and on its own it is refused before the request is even sent.
+        static let amend = Expectation(
+            scope: .publish,
+            notFoundAdvice: """
+                `stele amend` only ever moves a page that is still live — it never creates one, \
+                and it cannot bring back a page whose deadline has already passed, not even \
+                with `--ttl never`. Check the slug, and publish the page again with \
+                `stele publish --slug <name>` if it is gone.
+                """,
+            conflict: .slug(advice: """
+                Another live page holds that name. Choose a different `--slug`: dropping it \
+                asks for no rename rather than for another name, and an amendment never \
+                allocates one of its own.
+                """)
         )
         static let administration = Expectation(
             scope: .admin,
