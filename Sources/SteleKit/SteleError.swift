@@ -95,16 +95,23 @@ public enum SteleError: Error, Equatable, CustomStringConvertible {
                 name, or retire the existing one with `stele admin clients revoke <name>` and \
                 mint again — rotating a credential is revoke-then-mint under the same name.
                 """
+        // Two limits behind one status, and the advice differs by which was hit. A page's is
+        // small and is usually blown by something that did not need to be inline; an
+        // attachment's is far larger and blowing it means the file is genuinely too big. This
+        // side cannot tell them apart — the status is the same and the command is not in scope
+        // here — so both remedies are named rather than the wrong one being guessed at.
         case .pageTooLarge(let detail):
             return """
-                the page is over the server's size limit\(Self.suffix(detail)) Drop inline \
-                images and link them instead — the limit is on the HTML, and a data: URI \
-                counts against it.
+                the file is over the server's size limit\(Self.suffix(detail)) For a page, \
+                publish images with `stele attach` and link them instead of inlining them — a \
+                data: URI counts against the HTML. For an attachment, it is over this \
+                deployment's ceiling, which is a much larger one.
                 """
         case .unsupportedContentType(let detail):
             return """
                 the server will not store that content type\(Self.suffix(detail)) Publish one \
-                of the types it lists, or leave the type to the CLI.
+                of the types it lists, or leave the type to the CLI — pages and attachments \
+                accept different ones.
                 """
         case .upgradeRequired(let detail):
             return """

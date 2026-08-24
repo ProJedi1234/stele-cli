@@ -60,7 +60,10 @@ enum PageIO {
     ///
     /// Absolute, never "in 7 days", for the reason `Format.moment` already gives: the follow-up
     /// question to a relative date is always "so what date is that".
-    private static func lifetime(_ location: PageLocation) -> String {
+    ///
+    /// Not private, because `attach` prints its own stdout line and this one underneath it. One
+    /// spelling of a deadline across every command that has one to report.
+    static func lifetime(_ location: PageLocation) -> String {
         guard let expiry = location.expiresAt else { return "kept until deleted" }
         return "expires \(Format.moment(expiry))"
     }
@@ -143,6 +146,223 @@ struct PublishCommand: SteleCommand {
             using: credential
         )
         try PageIO.report(location, options: options)
+    }
+}
+
+/// Publishes bytes — an image, a video, a PDF — rather than a page.
+///
+/// The same route as `publish`, because on the server an attachment *is* a page whose body is
+/// bytes. What makes this a separate command is not the request but the answer: an attachment
+/// has two URLs, and which one a caller gets handed decides whether the page they write works.
+struct AttachCommand: SteleCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "attach",
+        abstract: "Publish an image, video or file. Prints the URL of the bytes.",
+        discussion: """
+            For the things a page links to rather than the page itself. Publish the file first, \
+            then put the URL you get back into the page you write:
+
+              src=$(stele attach screenshot.png)
+
+            Prints nothing but that URL on stdout, so the capture above works. It is \
+            deliberately the URL of the *bytes* — the one that belongs in an <img src> or a \
+            <video src>. The attachment has a second URL, a page about the file with its name, \
+            size and deadline, and that is the one to send a person; it goes to stderr under \
+            the deadline, and --json names both. Getting them the wrong way round fails \
+            silently — an <img> pointed at the viewer renders nothing, and both answer 200.
+
+            The type comes from the file's extension, and an extension this tool does not \
+            recognise is refused here rather than uploaded: use --content-type when the \
+            extension is missing or lying. The server keeps the real list and has the last word.
+
+            Attachments expire like pages, and this is the thing to get right because nothing \
+            will warn you: a page and the images inside it are separate publications with \
+            separate deadlines. A permanent page whose screenshots took the default becomes a \
+            page of broken images a week later, with no request failing at the time. Ask for \
+            the same --ttl on both.
+
+            `stele update`, `stele amend` and `stele delete` reach an attachment at its slug \
+            exactly as they reach a page.
+            """
+    )
+
+    @OptionGroup var options: GlobalOptions
+
+    @Argument(
+        help: ArgumentHelp("The file to publish.", valueName: "file"),
+        completion: .file()
+    )
+    var file: String
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Publish at this slug instead of a generated one.",
+            discussion: "Lowercase letters, digits and hyphens. The server has the last word.",
+            valueName: "name"
+        )
+    )
+    var slug: String?
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp("Override the type inferred from the file extension.", valueName: "type"),
+        completion: .list(ContentType.knownAttachments)
+    )
+    var contentType: String?
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "How long the file lives: a number of days, or 'never'.",
+            discussion: """
+                Means exactly what it means on `stele publish`, including the default — a file \
+                you say nothing about expires on the server's own schedule. Match it to the \
+                lifetime of the page that embeds it.
+                """,
+            valueName: "days"
+        ),
+        completion: .list([PageTTL.neverKeyword, "7", "30", "90"])
+    )
+    var ttl: String?
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "The name a browser saves the file under.",
+            discussion: """
+                Defaults to the name of the file you uploaded. Worth setting when that name is \
+                a temporary one: a slug is a name for a URL, and a download called \
+                quiet-cedar-otter opens in nothing.
+                """,
+            valueName: "name"
+        )
+    )
+    var filename: String?
+
+    func execute() async throws {
+        let bytes = try PageIO.read(file)
+        // Refused before the credential is read and long before the bytes travel. The server
+        // would answer this with a 415 of its own, but it would be answering about a type this
+        // side chose by defaulting — and `text/html` on a JPEG is not a disagreement with the
+        // server, it is a guess nobody made. Naming the flag is the whole value of catching it
+        // here; the same bargain `amend` strikes over having nothing to amend.
+        let type = try contentType ?? ContentType.attachmentInferred(fromPath: file)
+            .orThrow(Failure("""
+                cannot tell what kind of file \(file) is from its extension. Pass \
+                --content-type <type>, or use a file this tool recognises: \
+                \(ContentType.knownAttachmentExtensions.joined(separator: ", ")).
+                """))
+        let lifetime = try ttl.map { raw -> PageTTL in
+            do { return try PageTTL.parse(raw) } catch { throw Failure("\(error)") }
+        }
+        let credential = try options.credential()
+        let location = try await SteleClient(credential: credential).publish(
+            page: bytes,
+            contentType: type,
+            slug: slug,
+            ttl: lifetime,
+            filename: filename ?? Self.derivedFilename(from: file),
+            using: credential
+        )
+        try report(location)
+    }
+
+    /// The name to save the upload under when the caller did not choose one.
+    ///
+    /// The file's own basename, which is what the skill promises and is nearly always the name
+    /// the person meant. Nil when that name is one the server would refuse: those rules exist
+    /// because the value ends up in a `Content-Disposition`, and a filename with a quote in it
+    /// can close the header's quoted string early.
+    ///
+    /// Omitting beats failing here, and only here. This name was *derived* — the caller never
+    /// typed it — so refusing the upload over it would be a 400 about a parameter they did not
+    /// pass, when the server's own fallback (the slug) is a working download. An explicit
+    /// `--filename` skips this entirely and travels untouched, whatever it says, because there
+    /// the caller has an opinion and the server is the one that gets to answer it. The check is
+    /// a hint, not a copy of the rule — the same arrangement `ContentType` runs on.
+    static func derivedFilename(from path: String) -> String? {
+        let name = (path as NSString).lastPathComponent
+        guard !name.isEmpty, name.count <= 255 else { return nil }
+        let refused: Set<Character> = ["\"", "\\", "/", "\r", "\n", "\0"]
+        guard !name.contains(where: { refused.contains($0) || $0.isASCIIControl }) else {
+            return nil
+        }
+        return name
+    }
+
+    /// The report `PageIO.report` cannot make, because the URL an attachment answers with is
+    /// not the URL an attachment is used by.
+    private func report(_ location: PageLocation) throws {
+        // A viewer URL this client cannot turn into a bytes URL is a server answering
+        // strangely. Reported rather than papered over with the viewer: printing that on stdout
+        // would put the wrong URL into a page, which is the one outcome this command exists to
+        // prevent, and it would do it silently.
+        guard let bytes = SteleClient.bytesURL(for: location) else {
+            throw SteleError.malformedResponse(
+                "the server's URL for the attachment was not one this client could read"
+            )
+        }
+        if options.json {
+            Terminal.out(try Format.json(AttachmentReport(location: location, bytes: bytes)))
+            return
+        }
+        // Bare, and the bytes rather than the viewer: this is the value that gets captured and
+        // pasted into an `<img src>`.
+        Terminal.out(bytes)
+        Terminal.error(options.style.dim(PageIO.lifetime(location)))
+        Terminal.error(options.style.dim("page about it: \(location.url)"))
+    }
+}
+
+/// `stele attach --json`.
+///
+/// Hand-written rather than an encoding of `PageLocation`, and neither URL is called `url` —
+/// which is the decision worth keeping. `PageLocation.url` means "the viewer" everywhere else
+/// in this tool, and stdout here is the bytes, so whichever meaning `url` took would be wrong
+/// half the time and wrong *silently*: a caller reaching for `.url` would get a working URL of
+/// the wrong kind. Absent, they get nothing, and nothing is a failure they can see.
+private struct AttachmentReport: Encodable {
+    let slug: String
+    /// The file itself. What goes in an `<img src>`.
+    let bytes: String
+    /// The page about the file. What you send a person.
+    let viewer: String
+    /// Explicitly null for an attachment kept until it is deleted, never absent — a missing key
+    /// and a null one read the same to a careless caller, and `PageLocation` hand-writes its
+    /// encoder for this reason.
+    let expires: Date?
+
+    init(location: PageLocation, bytes: String) {
+        self.slug = location.slug
+        self.bytes = bytes
+        self.viewer = location.url
+        self.expires = location.expiresAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case slug, bytes, viewer, expires
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(slug, forKey: .slug)
+        try container.encode(bytes, forKey: .bytes)
+        try container.encode(viewer, forKey: .viewer)
+        try container.encode(expires, forKey: .expires)
+    }
+}
+
+extension Character {
+    /// The C0 controls, which cannot appear in a header value.
+    var isASCIIControl: Bool { isASCII && (asciiValue ?? 0x20) < 0x20 }
+}
+
+extension Optional {
+    /// `??` for a value that has an error rather than a fallback behind it.
+    func orThrow(_ error: @autoclosure () -> some Error) throws -> Wrapped {
+        guard let self else { throw error() }
+        return self
     }
 }
 

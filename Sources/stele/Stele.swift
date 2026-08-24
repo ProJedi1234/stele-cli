@@ -29,6 +29,7 @@ struct Stele: AsyncParsableCommand {
         subcommands: [
             AuthCommand.self,
             PublishCommand.self,
+            AttachCommand.self,
             UpdateCommand.self,
             AmendCommand.self,
             DeleteCommand.self,

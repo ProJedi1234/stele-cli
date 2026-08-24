@@ -40,8 +40,11 @@ enum Exit {
     /// which is why the message carries the route's own advice and this table does not repeat it.
     static let slugTaken: Int32 = 5
 
-    /// `413` / `415` — the page itself is the problem. Retrying is pointless; the input changes
-    /// or nothing does.
+    /// `413` / `415` — the file itself is the problem, whether it was a page or an attachment.
+    /// Retrying is pointless; the input changes or nothing does. The two are one code because
+    /// the caller's next move is the same shape either way, and `SteleError` carries the half
+    /// that differs: a page over the limit usually has something inline that `stele attach`
+    /// should have published, and an attachment over it is simply too big for the deployment.
     static let pageRejected: Int32 = 6
 
     /// `404` — an update to a slug that does not exist, an amendment or a deletion aimed at one
@@ -70,7 +73,7 @@ enum Exit {
             (credentialRejected, "the server rejected the credential — ask the user to log in again"),
             (forbidden, "valid credential, insufficient scope — an operator has to run this"),
             (slugTaken, "that slug is taken — ask for a different --slug"),
-            (pageRejected, "the page is too large or the wrong type"),
+            (pageRejected, "the file is too large or a type the server will not store"),
             (notFound, "no such page or client"),
             (upgradeRequired, "the CLI is too old — reinstall it and retry once"),
             (unreachable, "could not reach the server — retryable"),
