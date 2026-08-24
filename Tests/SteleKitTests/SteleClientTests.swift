@@ -121,6 +121,118 @@ struct SteleClientRequestTests {
         #expect(query == "slug=my-page&ttl=never")
     }
 
+    /// An attachment goes up through `publish` because on the server it *is* a page whose body
+    /// is bytes — same route, same namespace. The content type is the whole of what makes it
+    /// one, so this pins that the type asked for is the type sent, with no page-shaped default
+    /// substituted on the way.
+    @Test("an attachment is a publish with a binary content type and a filename")
+    func attachment() async throws {
+        let transport = FakeTransport(
+            status: 201,
+            body: #"{"slug":"quiet-cedar-otter","url":"https://stele.example.com/quiet-cedar-otter"}"#
+        )
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        let bytes = Data([0x89, 0x50, 0x4E, 0x47])
+        _ = try await client.publish(
+            page: bytes,
+            contentType: "image/png",
+            filename: "architecture.png",
+            using: credential
+        )
+
+        let request = try #require(await transport.last)
+        #expect(request.method == "POST")
+        #expect(request.url.absoluteString.hasPrefix("https://stele.example.com/pages?"))
+        #expect(request.body == bytes)
+        #expect(request.headerFields()["Content-Type"] == "image/png")
+        #expect(request.url.query == "filename=architecture.png")
+    }
+
+    /// The ordinary silent failure this parameter is heir to, and the one worth reading off the
+    /// URL: `?flename=` is not a `400` — the server has no reason to look at a parameter it does
+    /// not know — so the upload earns a `201` and the file downloads named after its slug.
+    @Test("a filename travels as ?filename=, spelled the server's way")
+    func filenameQuery() async throws {
+        let transport = FakeTransport(status: 201, body: #"{"slug":"a-b-c","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.publish(
+            page: Data("x".utf8), contentType: "image/png", filename: "chart.png",
+            using: credential
+        )
+
+        #expect(try #require(await transport.last).url.query == "filename=chart.png")
+    }
+
+    /// Three independent parameters, all built by appending. An assignment where an append
+    /// belonged would drop two of them and answer `201` regardless.
+    @Test("a slug, a lifetime and a filename all travel")
+    func slugLifetimeAndFilename() async throws {
+        let transport = FakeTransport(status: 201, body: #"{"slug":"chart","url":"u","expires":null}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.publish(
+            page: Data("x".utf8),
+            contentType: "image/png",
+            slug: "chart",
+            ttl: .never,
+            filename: "q3-revenue.png",
+            using: credential
+        )
+
+        let query = try #require(await transport.last).url.query
+        #expect(query == "slug=chart&ttl=never&filename=q3-revenue.png")
+    }
+
+    /// No `--filename` means no parameter at all. `?filename=` with nothing after it is a `400`
+    /// naming the parameter, and the server's own default — the slug — is a better name than
+    /// any placeholder this side could invent.
+    @Test("publishing without a filename sends no filename at all")
+    func noFilename() async throws {
+        let transport = FakeTransport(status: 201, body: #"{"slug":"a-b-c","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try await client.publish(page: Data("x".utf8), using: credential)
+
+        #expect(try #require(await transport.last).url.query == nil)
+    }
+
+    /// A filename is the one caller-supplied string here that a *browser* eventually acts on,
+    /// and it arrives from a path on disk rather than from a flag the user typed. It travels as
+    /// a query value, whole and unresolved — the path is `/pages` either way — for the server
+    /// to accept or refuse on its own terms. The server does refuse: quotes, backslashes and
+    /// control characters cannot appear in a name it hands to a browser.
+    @Test(
+        "a hostile filename stays one query value",
+        arguments: [
+            "../../etc/passwd",
+            #""; rm -rf /"#,
+            "report\r\nX-Injected: yes",
+        ]
+    )
+    func filenameStaysAValue(_ filename: String) async throws {
+        let transport = FakeTransport(status: 201, body: #"{"slug":"a-b-c","url":"u"}"#)
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        _ = try? await client.publish(
+            page: Data("x".utf8), contentType: "image/png", filename: filename, using: credential
+        )
+
+        let request = try #require(await transport.last)
+        #expect(request.url.path == "/pages")
+        #expect(request.url.standardized.path == "/pages")
+        let components = try #require(
+            URLComponents(url: request.url, resolvingAgainstBaseURL: false)
+        )
+        #expect(components.queryItems == [URLQueryItem(name: "filename", value: filename)])
+    }
+
     /// No `--ttl` means no parameter at all, which is a third thing and not a synonym for
     /// either value: absence is what asks for the server's default lifetime. `?ttl=` with
     /// nothing after it is a `400`, and `?ttl=never` would keep a page nobody asked to keep.
@@ -1067,5 +1179,59 @@ struct SteleErrorMappingTests {
             Issue.record("expected malformedResponse, got \(error)")
             return
         }
+    }
+}
+
+/// The two URLs an attachment has, and the rule about which is derived from what.
+@Suite("attachment URLs")
+struct AttachmentURLTests {
+    @Test("the bytes sit under /static, beside the viewer")
+    func bytesURL() {
+        let viewer = PageLocation(
+            slug: "quiet-cedar-otter", url: "https://stele.example.com/quiet-cedar-otter"
+        )
+        #expect(
+            SteleClient.bytesURL(for: viewer)
+                == "https://stele.example.com/static/quiet-cedar-otter"
+        )
+    }
+
+    /// The reason this is derived from the response rather than composed from the host we
+    /// dialled. A deployment reached over a tailnet name, or from behind a proxy, answers with
+    /// the base URL *it* is configured with — and that is the address the `<img src>` has to
+    /// carry, because the page outlives the machine that published it.
+    @Test("the server's own scheme, host and port are the ones kept")
+    func bytesURLFollowsTheServersBase() {
+        let viewer = PageLocation(slug: "chart", url: "https://pages.example.com:8443/chart")
+        #expect(
+            SteleClient.bytesURL(for: viewer) == "https://pages.example.com:8443/static/chart"
+        )
+    }
+
+    /// The slug goes through the same encoding every other path segment does. Nothing the
+    /// server allocates needs it — but the slug here is a string off a response, and a URL
+    /// printed for pasting into a page is the last place to start trusting one.
+    @Test("a slug that would not be one segment is encoded into one")
+    func bytesURLEncodesTheSlug() throws {
+        let viewer = PageLocation(slug: "../admin/clients", url: "https://stele.example.com/x")
+        let bytes = try #require(SteleClient.bytesURL(for: viewer))
+        #expect(bytes == "https://stele.example.com/static/..%2Fadmin%2Fclients")
+        // Still one segment after RFC 3986 dot-segment removal, which is the point: nothing
+        // here resolves into `/admin/clients`.
+        #expect(
+            URL(string: bytes)?.standardized.absoluteString
+                == "https://stele.example.com/static/..%2Fadmin%2Fclients"
+        )
+    }
+
+    /// A `url` that is not an absolute URL is a server answering strangely, not a caller
+    /// mistake — and it must not come back as a relative path. `/static/a-b-c` would print like
+    /// an answer and then resolve against whatever host the page embedding it is served from.
+    @Test(
+        "a viewer URL that is not absolute has no bytes URL",
+        arguments: ["", "/quiet-cedar-otter", "stele.example.com/quiet-cedar-otter"]
+    )
+    func bytesURLNeedsAnAbsoluteViewer(_ url: String) {
+        #expect(SteleClient.bytesURL(for: PageLocation(slug: "a-b-c", url: url)) == nil)
     }
 }
