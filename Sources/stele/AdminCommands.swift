@@ -202,22 +202,30 @@ struct ListClientsCommand: SteleCommand {
         let scopeWidth = max(
             6, min(24, clients.map { $0.scopes.joined(separator: ",").count }.max() ?? 6)
         )
-        Terminal.out(
-            style.dim(
-                [
-                    Format.pad("NAME", nameWidth), Format.pad("SCOPES", scopeWidth),
-                    Format.pad("CREATED", 16), Format.pad("LAST USED", 16), "STATE",
-                ].joined(separator: "  ")
-            )
-        )
-        for client in clients {
-            let row = [
-                Format.pad(client.name, nameWidth),
+        // Shown only when somebody signed in, which is not the same as always. A deployment
+        // that has not adopted GitHub sign-in — or one predating it, which answers no such key
+        // at all — would otherwise get a column of dashes in every row, and a column that is
+        // empty on every deployment it appears on teaches an operator to stop reading it.
+        let logins = clients.map { $0.githubLogin ?? "—" }
+        let loginWidth = clients.contains { $0.githubLogin != nil }
+            ? max(6, min(24, logins.map(\.count).max() ?? 6))
+            : nil
+        var header = [Format.pad("NAME", nameWidth)]
+        if let loginWidth { header.append(Format.pad("GITHUB", loginWidth)) }
+        header += [
+            Format.pad("SCOPES", scopeWidth),
+            Format.pad("CREATED", 16), Format.pad("LAST USED", 16), "STATE",
+        ]
+        Terminal.out(style.dim(header.joined(separator: "  ")))
+        for (client, login) in zip(clients, logins) {
+            var cells = [Format.pad(client.name, nameWidth)]
+            if let loginWidth { cells.append(Format.pad(login, loginWidth)) }
+            cells += [
                 Format.pad(client.scopes.joined(separator: ","), scopeWidth),
                 Format.pad(Format.moment(client.createdAt), 16),
                 Format.pad(Format.moment(client.lastUsedAt), 16),
-            ].joined(separator: "  ")
-            Terminal.out("\(row)  \(style.state(client))")
+            ]
+            Terminal.out("\(cells.joined(separator: "  "))  \(style.state(client))")
         }
     }
 }
@@ -231,6 +239,11 @@ struct ClientJSON: Encodable {
     let lastUsedAt: Date?
     let expiresAt: Date?
     let revokedAt: Date?
+    /// Who signed in for it. Absent when nobody did, and absent in the same way `expiresAt` is
+    /// — the synthesised encoder drops a nil optional — which is why the table's rule does not
+    /// have to be repeated here: an operator reading a column of dashes learns nothing, but a
+    /// reader of this asks for the key and gets nothing back, which is the same answer.
+    let githubLogin: String?
     let state: String
 
     init(_ summary: ClientSummary) {
@@ -240,6 +253,7 @@ struct ClientJSON: Encodable {
         self.lastUsedAt = summary.lastUsedAt
         self.expiresAt = summary.expiresAt
         self.revokedAt = summary.revokedAt
+        self.githubLogin = summary.githubLogin
         self.state = Format.state(summary)
     }
 }

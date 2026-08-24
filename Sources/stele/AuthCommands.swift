@@ -421,9 +421,19 @@ struct StatusCommand: SteleCommand {
             return
         }
         let style = options.style
-        let rows: [(String, String)] = [
+        var rows: [(String, String)] = [
             ("host", style.accent(host.value)),
             ("client", style.bold(summary.name)),
+        ]
+        // Only when there is one. A deployment that has not adopted GitHub sign-in — or one
+        // predating it, which does not answer the key at all — would otherwise print a row that
+        // says nothing on every machine it is run on, and `client` already carries the name.
+        // Worth showing when it exists because it need not match: the credential is addressed
+        // by a lowercased name and attributed to the spelling GitHub reports.
+        if let login = summary.githubLogin {
+            rows.append(("github", login))
+        }
+        rows += [
             ("scopes", summary.scopes.isEmpty ? "—" : summary.scopes.joined(separator: ", ")),
             ("expires", summary.expiresAt.map(Format.moment) ?? "never"),
             ("last used", Format.moment(summary.lastUsedAt)),
@@ -474,6 +484,10 @@ struct AuthStatus: Encodable {
     let lastUsedAt: Date?
     let expiresAt: Date?
     let revokedAt: Date?
+    /// The GitHub login this credential was minted for, when one was. Absent otherwise, the way
+    /// `expiresAt` is — this is a field the server either reports or does not, and unlike
+    /// `minted` below there is no answer this side could invent for it.
+    let githubLogin: String?
     let state: String
     let credentialFile: String
     /// False when the server could not be reached and these are the file's cached values.
@@ -500,6 +514,7 @@ struct AuthStatus: Encodable {
         self.lastUsedAt = summary.lastUsedAt
         self.expiresAt = summary.expiresAt
         self.revokedAt = summary.revokedAt
+        self.githubLogin = summary.githubLogin
         self.state = verified ? Format.state(summary) : "unverified"
         self.credentialFile = path
         self.verified = verified

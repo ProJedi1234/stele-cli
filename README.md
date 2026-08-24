@@ -65,7 +65,7 @@ beneath the deadline. `--json` names both and calls neither of them `url`.
 | Command | Who runs it | Does |
 | --- | --- | --- |
 | `stele auth login [--host <url>] [--admin]` | human, once | Prompts for the token on a TTY, verifies it, writes the credential `0600`. An operator token is *spent*, not stored — see below. |
-| `stele auth status` | agent or human | Host, client name, scopes, expiry — never the token. |
+| `stele auth status` | agent or human | Host, client name, scopes, expiry, and the GitHub login behind the credential when there is one — never the token. |
 | `stele auth logout` | human | Forgets the local credential. Does not revoke it. |
 | `stele publish <file> [--slug <name>] [--ttl <days>]` | agent | `POST /pages`. Prints the URL on stdout and the page's deadline on stderr. |
 | `stele attach <file> [--slug <name>] [--ttl <days>] [--filename <name>]` | agent | `POST /pages` with a binary type. Publishes an image, video or PDF. Prints the URL of the *bytes* on stdout — the one that goes in an `<img src>` — and the viewer's under the deadline on stderr. |
@@ -74,7 +74,7 @@ beneath the deadline. `--json` names both and calls neither of them `url`.
 | `stele delete <slug>` | agent | `DELETE /pages/:slug`. Permanent and immediate — the slug is freed and returns to the pool, so every link to it breaks. Prints nothing on stdout; the confirmation is on stderr. |
 | `stele skill` | agent | Proxies `GET /skill`, so the binary keeps zero copies of the contract. |
 | `stele admin clients create <name>` | operator | Mints a credential and prints the token **once**. `--scopes`, `--expires-in 90d`. |
-| `stele admin clients list` | operator | Names, scopes, last use, revocation state. |
+| `stele admin clients list` | operator | Names, scopes, last use, revocation state, and the GitHub login a credential was signed in for when there is one. |
 | `stele admin clients revoke <name>` | operator | Stops a credential working, keeping its record. |
 
 Every command takes `--host` and `--json`. Styling is a presentation layer only; the core
