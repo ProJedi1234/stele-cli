@@ -670,6 +670,50 @@ struct SteleClientRequestTests {
         #expect(request.headerFields()["Authorization"] != nil)
     }
 
+    /// The spelling has to be the server's, and it is not derivable from `name`: a credential is
+    /// addressed by a lowercased name — a URL path segment has no uppercase in its alphabet —
+    /// and attributed to the spelling GitHub reports. A key this client misspells decodes to nil
+    /// and reads as "nobody signed in for this", which is a wrong answer rather than a missing
+    /// one.
+    @Test("whoami reports the GitHub login a credential was minted for")
+    func whoamiCarriesTheGitHubLogin() async throws {
+        let transport = FakeTransport(
+            status: 200,
+            body: #"{"name":"projedi1234","scopes":["publish"],"githubLogin":"ProJedi1234"}"#
+        )
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        let summary = try await client.verifyCredential(credential)
+
+        #expect(summary.name == "projedi1234")
+        #expect(summary.githubLogin == "ProJedi1234")
+    }
+
+    /// Nil for the two deployments that answer nothing: one predating GitHub sign-in, which
+    /// omits the key entirely, and one that has it but where this credential was minted by an
+    /// operator instead. Both mean "no login to show", which is why they are not told apart —
+    /// and the absent key must not be a decoding failure, or `auth status` breaks against every
+    /// older server.
+    @Test("a credential with no GitHub login behind it decodes either way")
+    func githubLoginIsOptional() async throws {
+        let transport = FakeTransport(
+            status: 200,
+            body: """
+                {"clients":[{"name":"argos","scopes":["publish"]},
+                  {"name":"claude-code","scopes":["publish"],"githubLogin":null}]}
+                """
+        )
+        let credential = try testCredential()
+        let client = SteleClient(credential: credential, transport: transport)
+
+        let clients = try await client.listClients(using: credential)
+
+        #expect(clients.count == 2)
+        #expect(clients[0].githubLogin == nil)
+        #expect(clients[1].githubLogin == nil)
+    }
+
     /// The content type is a parameter with a default, not a constant: `stele publish notes.md`
     /// has to be able to say what it is publishing.
     @Test("an explicit content type is what gets sent")

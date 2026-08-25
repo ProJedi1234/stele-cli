@@ -83,6 +83,21 @@ public struct ClientSummary: Codable, Sendable, Equatable {
     /// falls back to the name only when it lands, and prefers this answer whenever there is one.
     public let shared: Bool?
 
+    /// The GitHub login this credential was minted for, when it was minted by signing in rather
+    /// than by an operator running `admin clients create`.
+    ///
+    /// Optional for `shared`'s reason and read the same way: a deployment predating GitHub
+    /// sign-in omits the key, and nil means "this server does not say" rather than "nobody".
+    /// The two nils are worth keeping apart in the renderer, but not here — this type reports
+    /// what the server said, and the absence is what it said.
+    ///
+    /// Recorded in the canonical spelling GitHub reports, which need not be `name`: the
+    /// credential is *addressed* by a lowercased name, because a URL path segment has no
+    /// uppercase in its alphabet, and attributed to the spelling its owner would recognise.
+    /// That difference is the only part of the identity the name does not already carry, and it
+    /// is why this is a field rather than something derived from `name`.
+    public let githubLogin: String?
+
     public init(
         name: String,
         scopes: [String],
@@ -90,7 +105,8 @@ public struct ClientSummary: Codable, Sendable, Equatable {
         lastUsedAt: Date? = nil,
         expiresAt: Date? = nil,
         revokedAt: Date? = nil,
-        shared: Bool? = nil
+        shared: Bool? = nil,
+        githubLogin: String? = nil
     ) {
         self.name = name
         self.scopes = scopes
@@ -99,6 +115,7 @@ public struct ClientSummary: Codable, Sendable, Equatable {
         self.expiresAt = expiresAt
         self.revokedAt = revokedAt
         self.shared = shared
+        self.githubLogin = githubLogin
     }
 
     public var isRevoked: Bool { revokedAt != nil }
