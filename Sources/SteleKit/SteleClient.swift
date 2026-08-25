@@ -61,7 +61,18 @@ public struct SteleClient: Sendable {
         public static let whoami = "/admin/whoami"
         public static let clients = "/admin/clients"
 
+        /// Where an attachment's bytes are served, with nothing rendered around them.
+        ///
+        /// The one path here that this client never sends a request to. It is a URL this tool
+        /// *prints* — the value that goes in an `<img src>` — and it lives with the others
+        /// because it is the same kind of fact: a segment agreed with another repository, whose
+        /// misspelling is a 404 in somebody's page rather than in a response we would see.
+        public static let staticFiles = "/static"
+
         public static func page(slug: String) -> String { "\(pages)/\(segment(slug))" }
+
+        /// One attachment's bytes, addressed by slug.
+        public static func bytes(slug: String) -> String { "\(staticFiles)/\(segment(slug))" }
         /// One credential, addressed by name — the handle every admin route uses. `GET` is not
         /// offered; `DELETE` here is what revokes.
         public static func client(named name: String) -> String { "\(clients)/\(segment(name))" }
@@ -109,6 +120,16 @@ public struct SteleClient: Sendable {
         /// `PATCH /pages/:slug`. One word on the wire in both places, and a literal at each call
         /// site would be two strings that have to agree with each other and with the server.
         public static let slug = "slug"
+
+        /// What a browser should save an attachment as.
+        ///
+        /// Attachments only, and the server says so: `?filename=` on a text page is a `400`
+        /// rather than a silent no-op, which makes this the one parameter in here whose
+        /// misspelling is *louder* than its absence — a typo lands in the general-purpose
+        /// silence this enum exists to prevent, but sending it where it does not belong is
+        /// caught. The failure to actually avoid is the ordinary one: `?flename=` on an
+        /// attachment is a download named after its slug, and a `201` either way.
+        public static let filename = "filename"
     }
 
     /// The type a page body is sent as when the caller expresses no opinion.
@@ -132,16 +153,32 @@ public struct SteleClient: Sendable {
     /// takes the server's own default lifetime, and only `.never` asks for a page that is kept
     /// until it is deleted. The returned `PageLocation` carries the deadline the server settled
     /// on either way, which is the only place the answer exists.
+    ///
+    /// An attachment is published through this same method, and that is not an omission: on the
+    /// server an attachment is a page whose body is bytes, stored by the same route under the
+    /// same namespace, and a second method here would invent a distinction the wire does not
+    /// have. What decides which one you get is `contentType` — a type on the server's
+    /// attachment allowlist stores bytes, anything else is validated as text — and `filename`,
+    /// which only an attachment may carry. A text page sent with one earns a `400` naming the
+    /// parameter, rather than having it quietly dropped.
+    ///
+    /// The returned `PageLocation.url` is the *viewer* in both cases. For an attachment that is
+    /// a page about the file rather than the file, so a caller embedding the result in an
+    /// `<img src>` wants `bytesURL(for:)` instead — see the note there about which URL is which.
     public func publish(
         page: Data,
         contentType: String = SteleClient.defaultContentType,
         slug: String? = nil,
         ttl: PageTTL? = nil,
+        filename: String? = nil,
         using credential: Credential
     ) async throws -> PageLocation {
         var query = slug.map { [URLQueryItem(name: Query.slug, value: $0)] } ?? []
         if let ttl {
             query.append(URLQueryItem(name: PageTTL.queryParameter, value: ttl.queryValue))
+        }
+        if let filename {
+            query.append(URLQueryItem(name: Query.filename, value: filename))
         }
         return try await send(
             method: "POST",
@@ -153,6 +190,42 @@ public struct SteleClient: Sendable {
             expectation: .write,
             decoding: PageLocation.self
         )
+    }
+
+    /// Where an attachment's bytes are, given what publishing it answered.
+    ///
+    /// Every attachment has two URLs and they are not interchangeable. `location.url` is the
+    /// *viewer* — an HTML page about the file, with its name, size and deadline, which is what
+    /// you send a person. This is the file itself, which is what goes in an `<img src>`, a
+    /// `<video src>` or a download link. Getting them the wrong way round fails silently: an
+    /// `<img>` pointed at the viewer renders nothing, and both URLs answer `200`.
+    ///
+    /// Derived from the response rather than composed from `credential.host`, which is the same
+    /// rule `amend` states about never rebuilding an address from the arguments, for a sharper
+    /// reason here. The server builds its URLs from its own configured base, and the address
+    /// this client happens to reach it on need not be that base — a deployment behind a proxy,
+    /// or reached over a tailnet name, answers with the public one. Composing from the host we
+    /// dialled would hand back a URL that works from this machine and from nowhere else, pasted
+    /// into a page that outlives the machine. So scheme, host and port come from the server's
+    /// own answer, and only the path is ours.
+    ///
+    /// Nil when the server's `url` is not an absolute URL, which is a server answering strangely
+    /// rather than anything a caller did — `SteleError.malformedResponse` is the shape that
+    /// fits. A scheme and a host are required rather than assumed, and that guard is the whole
+    /// of the check worth making: `URLComponents` parses `""` and a bare path quite happily, so
+    /// a viewer URL missing its front would come back here as `/static/quiet-cedar-otter` — a
+    /// string that looks enough like an answer to be printed, pasted into a page, and to
+    /// resolve against whatever host that page is served from.
+    public static func bytesURL(for location: PageLocation) -> String? {
+        guard var components = URLComponents(string: location.url),
+              components.scheme != nil, components.host != nil
+        else { return nil }
+        components.percentEncodedPath = Path.bytes(slug: location.slug)
+        // The viewer carries neither, but a base URL configured with one would, and neither
+        // belongs on the bytes.
+        components.query = nil
+        components.fragment = nil
+        return components.url?.absoluteString
     }
 
     /// `PUT /pages/:slug`. Replaces a page that already exists; never creates one.

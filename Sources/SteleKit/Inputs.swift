@@ -34,6 +34,45 @@ public enum ContentType {
         let ext = (path as NSString).pathExtension.lowercased()
         return byExtension[ext] ?? fallback
     }
+
+    /// Extension to type for the things `stele attach` uploads.
+    ///
+    /// A second map rather than more rows in `byExtension`, because the two are read under
+    /// opposite rules. Above, an unknown extension is a shrug that falls through to
+    /// `text/html`; here it has to be an error, so the two lookups cannot share an entry point
+    /// that returns a non-optional.
+    ///
+    /// SVG is absent deliberately and should stay absent. The server does not accept it — it is
+    /// the one image format that is also a document, script tags and all — and adding it here
+    /// would turn a considered `415` into a type this tool appears to offer.
+    static let attachmentsByExtension: [String: String] = [
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "webp": "image/webp",
+        "mp4": "video/mp4",
+        "webm": "video/webm",
+        "pdf": "application/pdf",
+    ]
+
+    /// What `stele attach --content-type` offers at TAB.
+    public static var knownAttachments: [String] { Set(attachmentsByExtension.values).sorted() }
+
+    /// The type to upload a file as, or nil when the extension says nothing.
+    ///
+    /// Optional where `inferred` is not, and that difference is the whole point. `text/html` is
+    /// a *plausible* guess for an unnamed page and a catastrophic one for a JPEG: the bytes go
+    /// up, the server validates them as UTF-8, and the `415` that comes back names a
+    /// content type nobody chose. A nil here lets the command refuse before spending the
+    /// upload, in a message that can name `--content-type` as the way through.
+    ///
+    /// This is still not the allowlist. An explicit `--content-type` is passed through
+    /// untouched, whatever it says, so a deployment that learns a new type is usable from an
+    /// installed build the day it ships.
+    public static func attachmentInferred(fromPath path: String) -> String? {
+        attachmentsByExtension[(path as NSString).pathExtension.lowercased()]
+    }
 }
 
 /// A human-written lifetime — `90d`, `12h` — as the seconds `POST /admin/clients` wants.

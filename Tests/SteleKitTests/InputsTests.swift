@@ -42,6 +42,68 @@ struct InputsTests {
         #expect(ContentType.inferred(fromPath: "archive.tar.gz") == ContentType.fallback)
     }
 
+    @Test(
+        "an attachment's type comes from its extension",
+        arguments: [
+            ("screenshot.png", "image/png"),
+            ("photo.jpg", "image/jpeg"),
+            ("photo.jpeg", "image/jpeg"),
+            ("loop.gif", "image/gif"),
+            ("shot.webp", "image/webp"),
+            ("clip.mp4", "video/mp4"),
+            ("clip.webm", "video/webm"),
+            ("report.pdf", "application/pdf"),
+        ]
+    )
+    func attachmentInference(_ path: String, _ expected: String) {
+        #expect(ContentType.attachmentInferred(fromPath: path) == expected)
+    }
+
+    @Test("attachment inference ignores case and leading directories")
+    func attachmentInferenceIsForgiving() {
+        #expect(ContentType.attachmentInferred(fromPath: "~/shots/SCREEN.PNG") == "image/png")
+        #expect(ContentType.attachmentInferred(fromPath: "/tmp/a.b.c/clip.MP4") == "video/mp4")
+    }
+
+    /// The inversion of `inferenceFallsThrough`, and the reason the two maps are separate. A
+    /// guess costs nothing on a page — `text/html` is what the tool is named for. On an upload
+    /// it costs the upload: the bytes go up, the server validates them as UTF-8 and answers
+    /// `415` naming a type nobody chose. Nil is what lets the command refuse first.
+    @Test("an unknown extension has no attachment type rather than a default one")
+    func attachmentInferenceRefusesToGuess() {
+        #expect(ContentType.attachmentInferred(fromPath: "screenshot") == nil)
+        #expect(ContentType.attachmentInferred(fromPath: "archive.tar.gz") == nil)
+    }
+
+    /// The two maps do not overlap, and neither is a superset of the other. A `.png` is not a
+    /// page and an `.html` is not an attachment, so each lookup declines the other's files in
+    /// the way its own caller can act on.
+    @Test("pages and attachments keep their own tables")
+    func theTablesStaySeparate() {
+        #expect(ContentType.attachmentInferred(fromPath: "page.html") == nil)
+        #expect(ContentType.inferred(fromPath: "screenshot.png") == ContentType.fallback)
+    }
+
+    /// SVG is the one image format that is also a document. The server does not accept it, and
+    /// offering it here would turn a considered `415` into a type this tool appears to know.
+    @Test("svg is not an attachment type this tool offers")
+    func svgIsNotOffered() {
+        #expect(ContentType.attachmentInferred(fromPath: "diagram.svg") == nil)
+        #expect(!ContentType.knownAttachments.contains("image/svg+xml"))
+    }
+
+    /// What TAB offers, deduplicated: two extensions map to `image/jpeg` and completing it
+    /// twice would read as two different types.
+    @Test("the completion list is the distinct attachment types, sorted")
+    func knownAttachmentsAreDistinct() {
+        #expect(
+            ContentType.knownAttachments == [
+                "application/pdf", "image/gif", "image/jpeg", "image/png", "image/webp",
+                "video/mp4", "video/webm",
+            ]
+        )
+    }
+
     /// Spelled out as a typed constant rather than inline in the `@Test` attribute: the macro
     /// expands its `arguments:` into a generic call the type checker gives up on when the
     /// literals need inference *and* arithmetic. The trailing case is a reminder that the
