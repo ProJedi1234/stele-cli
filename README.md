@@ -241,7 +241,7 @@ is.
 
 Code 8 is the version gate: the CLI sends `User-Agent: stele-cli/<version>` on every request and
 a server whose `minimumCLIVersion` is higher answers `426`. The remedy is printed with the
-error — `make -C ~/repos/stele-cli install`, then retry once.
+error — `just -f ~/repos/stele-cli/justfile install`, then retry once.
 
 ## Configuration
 
@@ -326,17 +326,17 @@ Same three commands the server's skill document gives an agent that finds `stele
 
 ```sh
 git clone git@github.com:ProJedi1234/stele-cli.git ~/repos/stele-cli
-make -C ~/repos/stele-cli install                # builds release, installs to ~/.local/bin
-make -C ~/repos/stele-cli install-completions    # optional, zsh only
+just -f ~/repos/stele-cli/justfile install                # builds release, installs to ~/.local/bin
+just -f ~/repos/stele-cli/justfile install-completions    # optional, zsh only
 ```
 
-Requires Swift 6.0+. Builds and runs on Linux and macOS. `PREFIX ?= ~/.local`, so
-`make install PREFIX=/usr/local` puts it elsewhere. The install writes to a temporary name and
+Requires Swift 6.0+ and [`just`](https://just.systems). Builds and runs on Linux and macOS.
+`PREFIX` defaults to `~/.local`, so `PREFIX=/usr/local just install` puts it elsewhere. The install writes to a temporary name and
 renames over the target, because writing over a binary that is currently executing fails with
 `ETXTBSY` and `rename(2)` does not — a second agent mid-publish must not be able to fail your
 reinstall.
 
-By hand, if you would rather not use `make`:
+By hand, if you would rather not use `just`:
 
 ```sh
 swift build -c release
@@ -355,11 +355,11 @@ Two traps worth naming, because neither error message points at its cause:
 ## Shell completion
 
 ```sh
-make install-completions   # writes _stele to oh-my-zsh's custom/completions, or ~/.zfunc
+just install-completions   # writes _stele to oh-my-zsh's custom/completions, or ~/.zfunc
 ```
 
 `~/.zfunc` needs `fpath=(~/.zfunc $fpath)` in `.zshrc` before `compinit`; oh-my-zsh's
-`custom/completions` is already on `fpath` and needs no edit. `make install-completions` removes
+`custom/completions` is already on `fpath` and needs no edit. `just install-completions` removes
 `~/.zcompdump*` afterwards, which is what makes the new completions appear without a manual cache
 purge. `stele --generate-completion-script {zsh,bash,fish}` emits the script directly if you
 install it elsewhere.

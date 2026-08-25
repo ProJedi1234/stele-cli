@@ -7,7 +7,7 @@ import SteleKit
 /// `stele --generate-completion-script zsh` bakes the command tree into a script; anything
 /// completed from live state is completed by the script spawning `stele` again at TAB time, so
 /// these run in a fresh process with no parsed options to consult. That is what
-/// `make install-completions` installs, and it needs regenerating when the tree changes, not
+/// `just install-completions` installs, and it needs regenerating when the tree changes, not
 /// when your hosts do.
 ///
 /// Nothing here reads a token, and nothing here can: `Credentials` exposes hosts and client
