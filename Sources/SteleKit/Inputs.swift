@@ -59,6 +59,13 @@ public enum ContentType {
     /// What `stele attach --content-type` offers at TAB.
     public static var knownAttachments: [String] { Set(attachmentsByExtension.values).sorted() }
 
+    /// The same table read the other way, for the message a refused file earns.
+    ///
+    /// Extensions rather than types, because they are what the person is holding. Told that a
+    /// deployment takes `image/png`, someone looking at `diagram.graffle` still has to work out
+    /// what to do; told the list is `png, jpg, …`, they already know.
+    public static var knownAttachmentExtensions: [String] { attachmentsByExtension.keys.sorted() }
+
     /// The type to upload a file as, or nil when the extension says nothing.
     ///
     /// Optional where `inferred` is not, and that difference is the whole point. `text/html` is

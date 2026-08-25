@@ -366,6 +366,88 @@ run_stele publish "$WORK/page.html" --ttl 3650000
 expect_eq "a lifetime past the server's ceiling is a 400, exit 1" "1" "$STATUS"
 
 # ---------------------------------------------------------------------------------
+section "4c. attach publishes bytes, and hands back the right one of two URLs"
+# ---------------------------------------------------------------------------------
+
+# A real PNG rather than bytes that merely claim to be one: the viewer renders it in an <img>,
+# and a server that stored it as text would corrupt it in a way `cmp` catches.
+base64 -d > "$WORK/dot.png" <<'B64'
+iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAAFUlEQVR42mP8z8BQz0AEYBxVSF+FABJADveWkH6oAAAAAElFTkSuQmCC
+B64
+
+run_stele attach "$WORK/dot.png"
+expect_eq "attach exits 0" "0" "$STATUS"
+BYTES_URL="$OUT"
+ATTACH_SLUG="${BYTES_URL##*/}"
+VIEWER_URL="$HOST/$ATTACH_SLUG"
+# The whole reason this command prints something `publish` does not. stdout is the bytes,
+# because that is the value that goes into an <img src>; a viewer URL here would render nothing
+# and answer 200 while doing it.
+case "$BYTES_URL" in
+    "$HOST"/static/*) pass "attach prints the bytes URL on stdout ($ATTACH_SLUG)" ;;
+    *) fail "attach prints the bytes URL" "$HOST/static/<slug>" "$BYTES_URL" ;;
+esac
+if [ "$(printf '%s' "$OUT" | wc -l)" -eq 0 ]; then
+    pass "…and stdout is that one line and nothing else"
+else
+    fail "stdout stays one line" "just the bytes URL" "$OUT"
+fi
+expect_contains "…with the deadline on stderr" "expires" "$ERR"
+expect_contains "…and the viewer URL beside it, for a human" "$VIEWER_URL" "$ERR"
+
+curl -sS "$BYTES_URL" -o "$WORK/fetched.png"
+if cmp -s "$WORK/dot.png" "$WORK/fetched.png"; then
+    pass "the attachment comes back byte for byte"
+else
+    fail "the attachment comes back byte for byte" "the PNG that was sent" "differing bytes"
+fi
+expect_eq "…served as the type it went up as" "image/png" \
+    "$(curl -sS -o /dev/null -w '%{content_type}' "$BYTES_URL")"
+
+# The second URL, and the reason the two may not be confused: this one is a document *about*
+# the file. Both answer 200, which is why getting them the wrong way round fails silently.
+expect_eq "the viewer URL answers too" "200" "$(http_status "$VIEWER_URL")"
+expect_contains "…as HTML, not as the bytes" "text/html" \
+    "$(curl -sS -o /dev/null -w '%{content_type}' "$VIEWER_URL")"
+
+# --filename is the one flag attach has that publish does not, and the header is the only place
+# its effect is visible. Without it a browser saves the download under the slug, which opens in
+# nothing.
+run_stele attach "$WORK/dot.png" --filename "architecture diagram.png" --json
+expect_eq "attach --json exits 0" "0" "$STATUS"
+printf '%s' "$OUT" > "$WORK/attach.json"
+expect_eq "…and --json puts nothing on stderr" "" "$ERR"
+expect_contains "…naming the bytes" "/static/" "$(json_field "$WORK/attach.json" bytes)"
+expect_eq "…and the viewer separately" "$HOST/$(json_field "$WORK/attach.json" slug)" \
+    "$(json_field "$WORK/attach.json" viewer)"
+# Neither is called `url`, deliberately: that key means "the viewer" on every other command, so
+# whichever meaning it took here would be wrong half the time and wrong silently.
+expect_eq "…and neither of them is called 'url'" "absent" \
+    "$(json_key_state "$WORK/attach.json" url)"
+expect_contains "the requested filename reaches the download header" "architecture diagram.png" \
+    "$(curl -sS -D - -o /dev/null "$HOST/static/$(json_field "$WORK/attach.json" slug)")"
+
+# Refused here, before the upload, and that is the point: the server would answer a 415 about
+# `text/html`, a type nobody chose, because falling back to it is what `publish` does.
+cp "$WORK/dot.png" "$WORK/mystery"
+run_stele attach "$WORK/mystery"
+expect_eq "a file whose extension says nothing is refused, exit 1" "1" "$STATUS"
+expect_contains "…and the message names the way through" "--content-type" "$ERR"
+expect_eq "…and nothing was published" "" "$OUT"
+
+run_stele attach "$WORK/mystery" --content-type image/png
+expect_eq "…while an explicit --content-type sends it" "0" "$STATUS"
+FORCED_BYTES="$OUT"
+expect_eq "…and it is served" "200" "$(http_status "$FORCED_BYTES")"
+
+# The three verbs that already existed reach an attachment at its slug, because on the server
+# an attachment is a page whose body is bytes. None of them learned what one is.
+run_stele delete "${FORCED_BYTES##*/}"
+expect_eq "delete takes an attachment down" "0" "$STATUS"
+expect_eq "…and the bytes are gone" "404" "$(http_status "$FORCED_BYTES")"
+expect_eq "…as is the page about them" "404" "$(http_status "$HOST/${FORCED_BYTES##*/}")"
+
+# ---------------------------------------------------------------------------------
 section "5. update replaces it in place"
 # ---------------------------------------------------------------------------------
 
@@ -706,14 +788,14 @@ expect_contains "…and returns the server's own skill document" "stele auth sta
 # ---------------------------------------------------------------------------------
 
 printf '\n\033[32msmoke: %d checks passed.\033[0m\n' "$CHECKS"
-# Eight pages, and the count is kept honest by hand because nothing here tracks them: sections 4
-# and 8 publish one each, 4b publishes four to compare lifetimes, and 5b leaves two. Only the
-# three below are permanent — the rest carry a deadline and the server reclaims them on its own
-# schedule — so those three are the ones named, because they are the ones a human ends up
-# deleting. Naming two of the ephemeral ones instead, as this line used to, sent whoever was
-# tidying up home with six rows still on the deployment.
-printf 'Left behind on %s: 8 pages and %d client rows, revoked.\n' "$HOST" 3
-printf 'Five of the pages expire on their own; these three never do: %s, %s, %s.\n' \
+# Ten rows, and the count is kept honest by hand because nothing here tracks them: sections 4
+# and 8 publish one each, 4b publishes four to compare lifetimes, 4c leaves two attachments, and
+# 5b leaves two. Only the three below are permanent — the rest carry a deadline and the server
+# reclaims them on its own schedule — so those three are the ones named, because they are the
+# ones a human ends up deleting. Naming two of the ephemeral ones instead, as this line used to,
+# sent whoever was tidying up home with six rows still on the deployment.
+printf 'Left behind on %s: 10 pages and %d client rows, revoked.\n' "$HOST" 3
+printf 'Seven of the pages expire on their own; these three never do: %s, %s, %s.\n' \
     "$NEVER_SLUG" "$MOVED" "$KEPT_MOVED"
-printf 'The server has no delete route, so pages and revoked credentials accumulate —\n'
+printf 'Revoked credentials have no route that removes them, so those rows accumulate —\n'
 printf 'which is why this belongs on a throwaway deployment, not a real one.\n'

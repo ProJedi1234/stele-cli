@@ -84,6 +84,16 @@ struct InputsTests {
         #expect(ContentType.inferred(fromPath: "screenshot.png") == ContentType.fallback)
     }
 
+    /// What a refused file's message lists. Extensions, because that is what the person is
+    /// holding — `image/png` is not an answer to "so what do I do with this .graffle".
+    @Test("the refusal message can name the extensions, not just the types")
+    func knownAttachmentExtensionsAreListed() {
+        #expect(
+            ContentType.knownAttachmentExtensions
+                == ["gif", "jpeg", "jpg", "mp4", "pdf", "png", "webm", "webp"]
+        )
+    }
+
     /// SVG is the one image format that is also a document. The server does not accept it, and
     /// offering it here would turn a considered `415` into a type this tool appears to know.
     @Test("svg is not an attachment type this tool offers")

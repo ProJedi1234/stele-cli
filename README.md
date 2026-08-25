@@ -24,6 +24,11 @@ $ stele publish report.html --slug q3-report --ttl never
 https://stele.example.com/q3-report
 kept until deleted
 
+$ stele attach chart.png --ttl never
+https://stele.example.com/static/plain-amber-heron
+kept until deleted
+page about it: https://stele.example.com/plain-amber-heron
+
 $ stele update q3-report report.html
 https://stele.example.com/q3-report
 kept until deleted
@@ -48,6 +53,13 @@ document. The deadline under the URL is on stderr for that reason, and it is pri
 because the server's default is *ephemeral* — a page published with no `--ttl` is eventually
 unpublished, and a caller handed only a URL would find that out when the link broke.
 
+`stele attach` is the one command whose stdout is not the URL the server answered with. An
+attachment has two: the bytes, under `/static/`, and a viewer page about the file. The bytes are
+what a page embeds and the viewer is what you send a person, and mixing them up fails silently —
+an `<img>` pointed at the viewer renders nothing, and both answer `200`. So the bytes go to
+stdout, where `src=$(stele attach chart.png)` captures them, and the viewer goes to stderr
+beneath the deadline. `--json` names both and calls neither of them `url`.
+
 ## Commands
 
 | Command | Who runs it | Does |
@@ -56,6 +68,7 @@ unpublished, and a caller handed only a URL would find that out when the link br
 | `stele auth status` | agent or human | Host, client name, scopes, expiry — never the token. |
 | `stele auth logout` | human | Forgets the local credential. Does not revoke it. |
 | `stele publish <file> [--slug <name>] [--ttl <days>]` | agent | `POST /pages`. Prints the URL on stdout and the page's deadline on stderr. |
+| `stele attach <file> [--slug <name>] [--ttl <days>] [--filename <name>]` | agent | `POST /pages` with a binary type. Publishes an image, video or PDF. Prints the URL of the *bytes* on stdout — the one that goes in an `<img src>` — and the viewer's under the deadline on stderr. |
 | `stele update <slug> <file>` | agent | `PUT /pages/:slug`. Never creates, and never changes the deadline. |
 | `stele amend <slug> [--slug <name>] [--ttl <days>]` | agent | `PATCH /pages/:slug`. Renames a page, moves its deadline, or both, without touching a byte of it. A rename is a hard move — the old URL starts 404ing at once. |
 | `stele delete <slug>` | agent | `DELETE /pages/:slug`. Permanent and immediate — the slug is freed and returns to the pool, so every link to it breaks. Prints nothing on stdout; the confirmation is on stderr. |
@@ -206,7 +219,7 @@ table.
 | 3 | the server rejected the credential — ask the user to log in again |
 | 4 | valid credential, insufficient scope — an operator has to run this |
 | 5 | that slug is taken — ask for a different `--slug` |
-| 6 | the page is too large or the wrong type |
+| 6 | the file is too large or a type the server will not store |
 | 7 | no such page or client |
 | 8 | the CLI is too old — reinstall it and retry once |
 | 9 | could not reach the server — retryable |
@@ -402,7 +415,7 @@ mint the first client. Arguments may also arrive as `STELE_SMOKE_HOST`, `STELE_S
 | `--psql <command>` | optional | A command that reaches the server's database, e.g. `docker exec stele-postgres psql -U stele -d stele_smoke`. Only the attribution check needs it, because no route reports who wrote a page — without it that one check prints `skip`. |
 
 It walks the whole documented lifecycle — mint, log in, `auth status`, publish, fetch the bytes
-back and compare them, update, amend, `--expires-in` there *and* back, expiry actually enforced,
+back and compare them, attach, update, amend, `--expires-in` there *and* back, expiry enforced,
 a publish-only credential answered `200` by whoami and `403` by the admin routes, revocation that
 really stops working, the exit-code vocabulary, the version gate, and the byte-identity of every
 `404`. It prints each check, stops at the first failure, and exits non-zero.
@@ -424,13 +437,14 @@ Two things it does not do, stated because a canary you trust wrongly is worse th
   refuses a pipe; the script asserts the *refusal* — which is the load-bearing custody rule — and
   then seeds the credential file at `0600` in the documented format for the rest of the run. The
   prompt, the echo-off read and the verify-before-write are not covered.
-- **It leaves litter.** The server has a delete route but this CLI ships no command that reaches
-  it, so each run leaves eight pages and three
-  credential rows behind; it revokes every credential it mints, but a revoked row is still a row.
-  Five of those pages expire on their own — the lifetime checks publish several deliberately —
-  but three were published or amended to `--ttl never` and will still be there next year. The
-  footer names those three, since they are the only ones a human ever has to clean up. Run it
-  against a throwaway deployment, never against production.
+- **It leaves litter.** Each run leaves ten pages and three credential rows behind. The pages it
+  deletes it deletes on purpose, to prove the verb works; the rest are the evidence the later
+  checks read, so they outlive the run. Credentials cannot be cleaned up at all — it revokes
+  every one it mints, but a revoked row is still a row. Seven of those pages expire on their own
+  — the lifetime checks publish several deliberately — but three were published or amended to
+  `--ttl never` and will still be there next year. The footer names those three, since they are
+  the only ones a human ever has to clean up. Run it against a throwaway deployment, never
+  against production.
 
 It also moves `~/.config/stele/credentials.json` aside and restores it on every exit path,
 including a failed check — see the `HOME` note under Configuration for why it cannot simply use a
