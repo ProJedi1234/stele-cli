@@ -110,7 +110,7 @@ public enum SteleError: Error, Equatable, CustomStringConvertible {
             return """
                 this stele build (\(SteleVersion.current)) is older than the server \
                 requires\(Self.suffix(detail)) Reinstall the CLI with \
-                `make -C ~/repos/stele-cli install` and retry once.
+                `just -f ~/repos/stele-cli/justfile install` and retry once.
                 """
         case .slugAllocationFailed(let detail):
             return """
