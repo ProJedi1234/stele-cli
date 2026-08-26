@@ -7,9 +7,10 @@ struct AuthCommand: AsyncParsableCommand {
         commandName: "auth",
         abstract: "Manage the stored credential.",
         discussion: """
-            `login` is the one command in this tool meant for a human: it reads the token from \
-            a terminal, checks it against the server and writes it 0600. Nothing else here, or \
-            anywhere else in the tree, will show you the token again.
+            `login` is the one command in this tool meant for a human: it signs in with GitHub \
+            in a browser the user opens themselves, checks what the server minted and writes it \
+            0600. Nothing else here, or anywhere else in the tree, will show you the token \
+            again.
             """,
         subcommands: [LoginCommand.self, StatusCommand.self, LogoutCommand.self],
         defaultSubcommand: StatusCommand.self
@@ -20,10 +21,26 @@ struct AuthCommand: AsyncParsableCommand {
 
 /// Records a credential for a deployment, after checking the server agrees it is one.
 ///
+/// The ordinary way in is a GitHub sign-in: this asks the server to start a device flow, prints
+/// the code and the URL for a person to open, and waits. The credential it walks away with is
+/// minted by the server and is publish-only. Nothing secret is typed at this terminal on that
+/// path — no stele token, and no GitHub token either. The OAuth app's client ID lives on the
+/// server and the access token GitHub issues is consumed inside one server request, so the only
+/// credential this machine ever holds is the one it is entitled to hold.
+///
+/// The pasted-token path is still here, and is not a legacy branch. It is what `--admin` uses,
+/// because a sign-in mints `publish` and can never produce the operator credential that flag
+/// asks for; and it is the fallback for a deployment that has not configured GitHub sign-in,
+/// which answers the start route with a refusal. Without it, `stele auth login` would have no
+/// answer at all on a server whose owners have not adopted the flow — including the first login
+/// against a fresh one, which is how the bootstrap token gets spent.
+///
 /// Verifying before writing is what stops a typo becoming a puzzle. A token stored unverified
 /// looks perfectly healthy in the file and fails at the next `stele publish`, which is a 401 an
 /// agent then reports to the user hours later; verifying here turns that into an error the
-/// person who typed it is still standing in front of.
+/// person who typed it is still standing in front of. It is also what the sign-in path does
+/// with what it was handed, for a second reason: a credential minted a moment ago and refused
+/// by `whoami` is one worth finding out about before it reaches the file.
 ///
 /// Verifying is also what makes the second rule possible: an `admin` token is not stored, it is
 /// *spent*. The server's answer says which kind of credential was pasted, and an operator's one
@@ -32,16 +49,24 @@ struct AuthCommand: AsyncParsableCommand {
 struct LoginCommand: SteleCommand {
     static let configuration = CommandConfiguration(
         commandName: "login",
-        abstract: "Store a credential for a stele deployment. Prompts on a terminal.",
+        abstract: "Sign in to a stele deployment and store the credential it mints.",
         discussion: """
-            The token is read from the terminal with echo off. It is never an argument and \
-            never an environment variable: argv shows up in `ps` and in shell history, and \
-            shell history is something an agent reads.
+            Signs in with GitHub: the server starts a device flow and this prints a code and a \
+            URL to open. Nothing is opened for you — the URL is printed and you decide where to \
+            open it, which is the only thing that works over SSH and in a container. The \
+            credential the server mints carries `publish`, and no GitHub token ever reaches \
+            this machine.
 
-            Paste an operator token and this mints a publish-only credential for this machine \
-            and stores that instead — the admin token is used for one request and never \
-            written to disk. Pass --admin to keep it, which is what the workstation you run \
-            `stele admin clients` from wants.
+            A deployment that has not configured GitHub sign-in falls back to a token read from \
+            the terminal with echo off. It is never an argument and never an environment \
+            variable: argv shows up in `ps` and in shell history, and shell history is \
+            something an agent reads.
+
+            On that path, paste an operator token and this mints a publish-only credential for \
+            this machine and stores that instead — the admin token is used for one request and \
+            never written to disk. Pass --admin to keep it, which is what the workstation you \
+            run `stele admin clients` from wants; that flag skips the sign-in, since a sign-in \
+            only ever mints `publish`.
 
             If stdin is not a TTY this command fails rather than reading it. Agents should ask \
             the user to run this themselves.
@@ -64,6 +89,10 @@ struct LoginCommand: SteleCommand {
                 For the machine you administer the deployment from. A credential file holds one \
                 credential per host, so this machine will hold `admin` instead of `publish` and \
                 `stele publish` will stop working on it — the two scopes are disjoint.
+
+                Skips the GitHub sign-in and prompts for a token, because signing in mints \
+                `publish` and only `publish`: there is no sign-in that ends in the credential \
+                this flag asks to keep.
                 """
         )
     )
@@ -72,7 +101,139 @@ struct LoginCommand: SteleCommand {
     func execute() async throws {
         var credentials = try options.store.load()
         let host = try resolveHost(existing: credentials)
+        let client = SteleClient(host: host)
 
+        // `--admin` asks for an operator credential, and a sign-in cannot produce one: what the
+        // exchange mints carries `publish` and only `publish`. Starting a flow whose answer is
+        // the wrong scope would waste a person's trip to a browser to arrive somewhere the flag
+        // already said was wrong, so it goes straight to the prompt.
+        if !admin, let bundle = try await beginSignIn(on: host, client: client) {
+            try await completeSignIn(bundle, on: host, client: client, into: &credentials)
+            return
+        }
+
+        try await loginWithAPastedToken(on: host, client: client, into: &credentials)
+    }
+
+    /// Asks the server to start a GitHub sign-in and tells the user what to do with it.
+    ///
+    /// Nil means this deployment does not offer one — the caller falls back to a pasted token.
+    /// A refusal is how that arrives and it is not a mistake in the reading: the server answers
+    /// an unconfigured client ID with the same bytes it refuses a sign-in with, deliberately, so
+    /// that a prober cannot tell a deployment with no OAuth app from one whose allowlist they
+    /// are not on. This side is not a prober and can simply try the other door.
+    ///
+    /// A 404 falls back too, with its own sentence. A stele server that predates the device
+    /// flow answers this path with its uniform 404 — the same page it gives every unknown
+    /// slug, deliberately, so the route's absence is not a probe result either — and for as
+    /// long as such servers exist, "this CLI is newer than that server" is the likeliest
+    /// meaning of the status. The generic notFound error would read as "wrong host", which
+    /// sends the person auditing the URL they typed instead of updating the deployment; the
+    /// token prompt is the door that still works on exactly those servers.
+    private func beginSignIn(on host: SteleHost, client: SteleClient) async throws
+        -> DeviceCodeBundle?
+    {
+        let bundle: DeviceCodeBundle
+        do {
+            bundle = try await client.startDeviceSignIn()
+        } catch let error as SteleError {
+            // Said before the prompt appears, because a person who ran this expecting a browser
+            // and got a token prompt deserves to know which of the two happened. The two
+            // sentences are hedged differently on purpose. A 401 is a deployment that answered
+            // and declined, and the server does not say why — the caller here is a human at
+            // their own terminal rather than a prober, but the answer is the same bytes either
+            // way. A 404 is a server that has never heard of the route, and the version gap is
+            // named as a maybe rather than a fact: all this side has seen is a status code that
+            // an arbitrary non-stele host would also produce.
+            switch error {
+            case .unauthorized:
+                Terminal.error(
+                    options.style.dim(
+                        "\(host) did not offer a GitHub sign-in — asking for a token instead."
+                    )
+                )
+            case .notFound:
+                Terminal.error(
+                    options.style.dim(
+                        "\(host) has no sign-in route — the server may predate the device "
+                            + "flow. Asking for a token instead."
+                    )
+                )
+            default:
+                throw error
+            }
+            return nil
+        }
+
+        // stderr, like every other prompt: `stele auth login --json` still emits exactly one
+        // document on stdout, and this is the question rather than the answer.
+        let style = options.style
+        Terminal.error("sign in to \(style.accent(host.value)) with GitHub.")
+        Terminal.error("  open \(style.accent(bundle.verificationURI))")
+        Terminal.error("  enter the code \(style.bold(bundle.userCode))")
+        Terminal.error(
+            style.dim("waiting for GitHub — this window can be left open. Ctrl-C to stop.")
+        )
+        return bundle
+    }
+
+    /// Waits for the sign-in to be approved, then verifies and files what it minted.
+    ///
+    /// The credential arrives already minted, so from `verifyCredential` onwards this is the
+    /// same path a pasted token takes — the same `whoami` check and the same one line that
+    /// writes to disk. `LoginDecision` is deliberately not consulted: its whole subject is which
+    /// kind of credential was *pasted*, and there is nothing to decide about one the server just
+    /// minted to be publish-only.
+    private func completeSignIn(
+        _ bundle: DeviceCodeBundle,
+        on host: SteleHost,
+        client: SteleClient,
+        into credentials: inout Credentials
+    ) async throws {
+        switch try await DeviceSignIn(client: client).complete(bundle) {
+        case .refused:
+            // One sentence for several facts, because one refusal is all the server said. It
+            // covers a cancelled authorisation, an account that is not an owner here, and a
+            // deployment with no owners configured — and it names the only move that is open
+            // either way rather than guessing which of them happened.
+            throw Failure(
+                "sign-in failed or was cancelled — run `stele auth login` to try again."
+            )
+        case .expired:
+            // Split from the refusal because it is the one outcome that is nobody's decision:
+            // the code simply timed out, usually because the browser was never opened.
+            throw Failure(
+                "the code expired before it was approved — run `stele auth login` to try again."
+            )
+        case .minted(let minted):
+            let token: Token
+            do {
+                token = try minted.token.inCustody()
+            } catch {
+                throw Self.signInLost(
+                    minted.client.name,
+                    on: host,
+                    "the token it sent back is not one a credential can hold."
+                )
+            }
+            let credential = Credential(host: host, clientName: minted.client.name, token: token)
+            let summary: ClientSummary
+            do {
+                summary = try await client.verifyCredential(credential)
+            } catch {
+                throw Self.signInLost(minted.client.name, on: host, "\(error)")
+            }
+            try store(token, as: summary, on: host, origin: .signedIn, into: &credentials)
+        }
+    }
+
+    /// The original path: a token typed at the terminal, verified, and then either stored or
+    /// spent on minting the credential that is stored instead.
+    private func loginWithAPastedToken(
+        on host: SteleHost,
+        client: SteleClient,
+        into credentials: inout Credentials
+    ) async throws {
         let raw = try Prompt().secret("token for \(host): ")
         // `Token` refuses an empty or header-unsafe value here, before anything is sent and
         // long before anything is written.
@@ -81,7 +242,6 @@ struct LoginCommand: SteleCommand {
         // The name is not known until the server answers; this placeholder exists for exactly
         // one HTTP request and is replaced before anything reaches the disk.
         let provisional = Credential(host: host, clientName: "", token: token)
-        let client = SteleClient(host: host)
         let summary = try await client.verifyCredential(provisional)
 
         // The hostname is read here rather than inside `LoginDecision`, for the reason
@@ -95,11 +255,11 @@ struct LoginCommand: SteleCommand {
 
         switch decision {
         case .store:
-            try store(token, as: summary, on: host, minted: false, into: &credentials)
+            try store(token, as: summary, on: host, origin: .pasted, into: &credentials)
 
         case .storeAdmin(let shared):
             warnAboutKeepingAdmin(shared: shared, host: host)
-            try store(token, as: summary, on: host, minted: false, into: &credentials)
+            try store(token, as: summary, on: host, origin: .pasted, into: &credentials)
 
         case .mint(let suggestedName, let shared):
             let minted = try await mint(
@@ -125,7 +285,9 @@ struct LoginCommand: SteleCommand {
                     "the token it sent back is not one a credential can hold."
                 )
             }
-            try store(token, as: minted.client, on: host, minted: true, into: &credentials)
+            try store(
+                token, as: minted.client, on: host, origin: .mintedByOperator, into: &credentials
+            )
         }
     }
 
@@ -235,15 +397,49 @@ struct LoginCommand: SteleCommand {
         return name
     }
 
+    /// Where the credential being filed came from.
+    ///
+    /// Three things depend on it and they are kept together rather than as three booleans at the
+    /// call sites: the `minted` field `--json` promises, the reassurance printed under a
+    /// successful login, and what an operator is told if the credential is live on the server
+    /// and its only plaintext could not be kept.
+    private enum Origin {
+        /// Verified and stored as it was typed. Nothing was minted, so nothing can be orphaned.
+        case pasted
+        /// Minted with an operator token that was spent for the purpose and never written down.
+        case mintedByOperator
+        /// Minted by the server at the end of a GitHub sign-in.
+        case signedIn
+
+        /// Whether this login *created* the credential it is storing — which is also the
+        /// assurance that whatever was pasted, if anything was, reached no file.
+        var minted: Bool {
+            switch self {
+            case .pasted: return false
+            case .mintedByOperator, .signedIn: return true
+            }
+        }
+
+        /// The one thing worth saying that the rest of the output does not already say, or
+        /// nothing. Printed on the branch where it is true rather than as a footer.
+        var reassurance: String? {
+            switch self {
+            case .pasted: return nil
+            case .mintedByOperator: return "the admin token was not written to disk."
+            case .signedIn: return "no GitHub token ever reached this machine."
+            }
+        }
+    }
+
     /// Files the credential and reports it.
     ///
-    /// One path for all three decisions, so the reporting cannot drift between them and so there
-    /// is exactly one line in this command that writes a token to disk.
+    /// One path for every way in, so the reporting cannot drift between them and so there is
+    /// exactly one line in this command that writes a token to disk.
     private func store(
         _ token: Token,
         as summary: ClientSummary,
         on host: SteleHost,
-        minted: Bool,
+        origin: Origin,
         into credentials: inout Credentials
     ) throws {
         credentials.set(
@@ -254,17 +450,27 @@ struct LoginCommand: SteleCommand {
         do {
             try options.store.save(credentials)
         } catch {
-            guard minted else { throw error }
-            throw Self.orphaned(
-                summary.name, on: host, "could not write the credential file: \(error)."
-            )
+            switch origin {
+            case .pasted: throw error
+            case .mintedByOperator:
+                throw Self.orphaned(
+                    summary.name, on: host, "could not write the credential file: \(error)."
+                )
+            case .signedIn:
+                throw Self.signInLost(
+                    summary.name, on: host, "could not write the credential file: \(error)."
+                )
+            }
         }
 
         if options.json {
             Terminal.out(
                 try Format.json(
                     AuthStatus(
-                        host: host, summary: summary, path: options.store.path, minted: minted
+                        host: host,
+                        summary: summary,
+                        path: options.store.path,
+                        minted: origin.minted
                     )
                 )
             )
@@ -280,10 +486,10 @@ struct LoginCommand: SteleCommand {
             Terminal.out(style.dim("expires \(Format.moment(expiry))"))
         }
         Terminal.out(style.dim("stored 0600 in \(Format.tildify(options.store.path))"))
-        if minted {
-            // The reassurance the whole command exists to be able to give, and it is only worth
-            // saying where it is true — so it is printed on this branch and not as a footer.
-            Terminal.out(style.dim("the admin token was not written to disk."))
+        if let reassurance = origin.reassurance {
+            // The reassurance the whole command exists to be able to give, and it says a
+            // different true thing depending on how the credential was got.
+            Terminal.out(style.dim(reassurance))
         }
     }
 
@@ -299,6 +505,24 @@ struct LoginCommand: SteleCommand {
         Failure(
             "minted '\(name)' on \(host), but \(problem) That credential is live and its token "
                 + "is now lost — revoke it with `stele admin clients revoke \(name)`."
+        )
+    }
+
+    /// A credential a sign-in minted, whose plaintext this side then failed to keep.
+    ///
+    /// The same bad state `orphaned` describes and a different remedy, which is why it is a
+    /// second message rather than a shared one. There the operator holds the token that can
+    /// revoke the stranded credential; here they hold nothing at all — a sign-in mints
+    /// `publish`, which cannot revoke anything. What recovers it is signing in again: the
+    /// exchange retires whatever live credential holds the login's name before minting the
+    /// replacement, so the stranded row is cleaned up by the retry rather than by an operator.
+    private static func signInLost(
+        _ name: String, on host: SteleHost, _ problem: String
+    ) -> Failure {
+        Failure(
+            "signed in to \(host) and the server minted '\(name)', but \(problem) Nothing was "
+                + "written. Run `stele auth login` again — the next sign-in retires that "
+                + "credential and mints another under the same name."
         )
     }
 

@@ -12,9 +12,13 @@ sees it.
 ```
 $ stele auth login
 host (e.g. https://stele.example.com): https://stele.example.com
-token for https://stele.example.com:
-authenticated as claude-code on https://stele.example.com — scopes: publish
+sign in to https://stele.example.com with GitHub.
+  open https://github.com/login/device
+  enter the code WDJB-MJHT
+waiting for GitHub — this window can be left open. Ctrl-C to stop.
+authenticated as projedi1234 on https://stele.example.com — scopes: publish
 stored 0600 in ~/.config/stele/credentials.json
+no GitHub token ever reached this machine.
 
 $ stele publish report.html
 https://stele.example.com/quiet-cedar-otter
@@ -64,7 +68,7 @@ beneath the deadline. `--json` names both and calls neither of them `url`.
 
 | Command | Who runs it | Does |
 | --- | --- | --- |
-| `stele auth login [--host <url>] [--admin]` | human, once | Prompts for the token on a TTY, verifies it, writes the credential `0600`. An operator token is *spent*, not stored — see below. |
+| `stele auth login [--host <url>] [--admin]` | human, once | Signs in with GitHub — prints a code and a URL to open, waits, writes the credential it is minted `0600`. Falls back to a token read from a TTY where the deployment has no GitHub sign-in; an operator token is *spent*, not stored — see below. |
 | `stele auth status` | agent or human | Host, client name, scopes, expiry, and the GitHub login behind the credential when there is one — never the token. |
 | `stele auth logout` | human | Forgets the local credential. Does not revoke it. |
 | `stele publish <file> [--slug <name>] [--ttl <days>]` | agent | `POST /pages`. Prints the URL on stdout and the page's deadline on stderr. |
@@ -84,12 +88,46 @@ a machine contract.
 
 ## Getting a credential onto a machine
 
+`stele auth login` signs in with GitHub. The server starts a device flow; this prints a short
+code and a URL, and a person opens that URL wherever they like. Nothing is launched for them,
+deliberately — a CLI that shells out to a browser opens nothing over SSH, nothing in a
+container, and on a shared machine it opens a page on somebody else's display. What comes back
+is a publish-only credential the server minted, verified and written `0600`:
+
+```
+$ stele auth login
+sign in to https://stele.example.com with GitHub.
+  open https://github.com/login/device
+  enter the code WDJB-MJHT
+waiting for GitHub — this window can be left open. Ctrl-C to stop.
+authenticated as projedi1234 on https://stele.example.com — scopes: publish
+stored 0600 in ~/.config/stele/credentials.json
+no GitHub token ever reached this machine.
+```
+
+The flow is proxied end to end, and that is the whole point of it. The OAuth app's client ID
+lives on the server, and the GitHub access token is born and dies inside one server request —
+this machine holds neither. A login that pastes a GitHub token would have removed a *stele*
+secret from the agent's reach by putting a *GitHub* one on the same disk, which is a worse
+credential to lose.
+
+Signing in again is the recovery for a lost or forgotten credential. The server retires whatever
+live credential holds that login's name and mints a replacement, which is the only recovery
+there can be: it keeps a SHA-256 and cannot reissue a token it never stored.
+
+Two things fall back to a token typed at the terminal. `--admin` skips the sign-in outright,
+because what a sign-in mints carries `publish` and only `publish` — it can never produce the
+operator credential that flag asks for. And a deployment that has not configured GitHub sign-in
+refuses the start route, which is also how the very first credential on a fresh deployment gets
+made: the bootstrap token is in the server's environment and nobody has signed in yet.
+
 An `admin` token is not a credential to keep. It is the one thing that can mint credentials, and
 on this server it cannot even publish — `admin` and `publish` are disjoint, so a machine holding
 the operator token can revoke every credential on the deployment and cannot upload a page.
 
-So `stele auth login` spends it. Paste an operator token and it mints a publish-only credential
-named after the machine, stores *that*, and never writes what you pasted to disk:
+So on that path `stele auth login` spends it. Paste an operator token and it mints a
+publish-only credential named after the machine, stores *that*, and never writes what you pasted
+to disk:
 
 ```
 $ stele auth login
@@ -130,8 +168,8 @@ sitting at, or to mint a credential with a non-default scope or lifetime. What c
 it is no longer the only way — and the common case, a machine credentialling itself, no longer
 routes a shown-once secret through a second terminal.
 
-One trade this makes deliberately: the operator token now gets typed at a TTY on the machine
-being provisioned, rather than never leaving the workstation. It is read with echo off, used for
+One trade the pasted path makes deliberately: the operator token gets typed at a TTY on the
+machine being provisioned, rather than never leaving the workstation. It is read with echo off, used for
 one request and never written down — but it is a real exposure, and `admin clients create`
 remains available for anyone who would rather carry the minted token instead.
 

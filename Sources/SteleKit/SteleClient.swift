@@ -61,6 +61,14 @@ public struct SteleClient: Sendable {
         public static let whoami = "/admin/whoami"
         public static let clients = "/admin/clients"
 
+        /// Starts a GitHub device sign-in. Unauthenticated, like the route below it: the caller
+        /// is here precisely because it holds no credential yet.
+        public static let authDevice = "/auth/github/device"
+        /// Redeems the device code the route above issued. The same path the server used to
+        /// take a raw GitHub access token on — that body is gone, and this client never sends
+        /// one: a token pasted at a prompt is a token this machine has held.
+        public static let authExchange = "/auth/github/exchange"
+
         /// Where an attachment's bytes are served, with nothing rendered around them.
         ///
         /// The one path here that this client never sends a request to. It is a URL this tool
@@ -370,6 +378,89 @@ public struct SteleClient: Sendable {
         return markdown
     }
 
+    // MARK: - Signing in
+
+    /// `POST /auth/github/device` — begin a GitHub sign-in, and get back what to show a human.
+    ///
+    /// The whole flow is proxied. This client never learns the OAuth app's client ID and never
+    /// touches the GitHub access token the flow eventually produces: the server holds the one
+    /// and consumes the other inside a single request, and what comes back here is a stele
+    /// credential or nothing. That is the same custody argument the credential file rests on,
+    /// moved one step earlier — a login that pasted a GitHub token would have put a *GitHub*
+    /// secret on the machine to avoid putting a stele one there.
+    ///
+    /// A `401` here is the deployment declining rather than refusing the caller: it is the
+    /// byte-identical answer an unconfigured `STELE_GITHUB_CLIENT_ID` gives, and it is
+    /// indistinguishable — deliberately, on the server's side — from an empty owner allowlist.
+    /// So it surfaces as `SteleError.unauthorized` and the caller decides what to do about a
+    /// deployment that does not offer this. `auth login` falls back to a pasted token.
+    public func startDeviceSignIn() async throws -> DeviceCodeBundle {
+        let response = try await perform(
+            SteleRequest(
+                method: "POST",
+                // No body and no `Content-Type`. The route reads neither, and an empty JSON
+                // object would be this client inventing a shape for the server to ignore.
+                url: try url(path: Path.authDevice, on: host),
+                credential: nil,
+                timeout: timeout
+            ),
+            host: host,
+            expectation: .any
+        )
+        return try Self.decode(DeviceCodeBundle.self, from: response.body)
+    }
+
+    /// `POST /auth/github/exchange` — one poll of a device sign-in.
+    ///
+    /// The one method here whose *status* is the answer rather than a pass-or-fail, which is why
+    /// it calls `perform` directly the way `delete` and `fetchSkill` do. A `202` means nobody has
+    /// approved the code yet and is a perfectly good outcome; routed through `send` it would be
+    /// handed to a decoder expecting a minted credential and reported as the server answering
+    /// strangely.
+    ///
+    /// A `401` becomes `.refused` rather than an error, and that is the shape of the server's
+    /// promise rather than a swallowed failure: expired, cancelled, not an owner and no
+    /// allowlist are one byte-identical refusal, so there is nothing to describe and nothing to
+    /// branch on. Everything else — a `500` because the server could not reach GitHub, a
+    /// transport failure, a body this client cannot read — throws, so a poll loop can never
+    /// mistake an outage for a person saying no.
+    public func redeemDeviceCode(_ deviceCode: String) async throws -> DevicePoll {
+        let response: SteleResponse
+        do {
+            response = try await perform(
+                SteleRequest(
+                    method: "POST",
+                    url: try url(path: Path.authExchange, on: host),
+                    contentType: "application/json",
+                    body: try JSONEncoder().encode(RedeemDeviceCodeRequest(deviceCode: deviceCode)),
+                    credential: nil,
+                    timeout: timeout
+                ),
+                host: host,
+                expectation: .any
+            )
+        } catch let error as SteleError {
+            guard case .unauthorized = error else { throw error }
+            return .refused
+        }
+
+        guard response.status != 202 else {
+            return .pending(interval: Self.pendingInterval(from: response.body))
+        }
+        return .minted(try Self.decode(MintedClient.self, from: response.body))
+    }
+
+    /// The interval a `202` asked for, or nil when it named none.
+    ///
+    /// Read leniently and on purpose. The interval is advice — the flow already has one from the
+    /// start response, and `DeviceSignIn` only ever raises it — so a `202` whose body this
+    /// client cannot read is not worth failing a sign-in over that is otherwise going fine. Nil
+    /// means "keep polling as before", which is what an older or newer server that spells this
+    /// differently should get.
+    static func pendingInterval(from body: Data) -> Int? {
+        try? JSONDecoder.stele.decode(PendingResponse.self, from: body).interval
+    }
+
     // MARK: - The credential itself
 
     /// `GET /admin/whoami` — who this credential says we are, according to the server.
@@ -488,6 +579,19 @@ public struct SteleClient: Sendable {
         let expiresIn: Int?
     }
 
+    /// The JSON body a poll sends. One field, spelled the server's way — and spelled in *its*
+    /// vocabulary rather than GitHub's `device_code`, for the reason the server gives about its
+    /// own body: this is stele's contract with its client, and borrowing the upstream spelling
+    /// is the start of a wire format that pretends to be a proxy for somebody else's.
+    private struct RedeemDeviceCodeRequest: Encodable {
+        let deviceCode: String
+    }
+
+    /// What a `202` carries. Optional even here: see `pendingInterval`.
+    private struct PendingResponse: Decodable {
+        let interval: Int?
+    }
+
     /// `GET /admin/clients` answers with an object, not a bare array: a JSON array cannot grow a
     /// sibling field, so the envelope is what lets a cursor or a total appear later without
     /// breaking every parser. Unwrapped here so callers see the list.
@@ -519,12 +623,19 @@ public struct SteleClient: Sendable {
             host: target,
             expectation: expectation
         )
+        return try Self.decode(T.self, from: response.body)
+    }
+
+    /// Decodes a response body, or reports that the server answered in a shape this client does
+    /// not know.
+    ///
+    /// The decoding error itself, not the body: a body that failed to decode is a body this
+    /// client did not understand, and echoing an unknown server's bytes into an error message is
+    /// how something unexpected ends up in a transcript.
+    static func decode<T: Decodable>(_ type: T.Type, from body: Data) throws -> T {
         do {
-            return try JSONDecoder.stele.decode(T.self, from: response.body)
+            return try JSONDecoder.stele.decode(T.self, from: body)
         } catch {
-            // The decoding error itself, not the body: a body that failed to decode is a body
-            // this client did not understand, and echoing an unknown server's bytes into an
-            // error message is how something unexpected ends up in a transcript.
             throw SteleError.malformedResponse("\(error)")
         }
     }
