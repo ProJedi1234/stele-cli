@@ -122,6 +122,14 @@ struct LoginCommand: SteleCommand {
     /// an unconfigured client ID with the same bytes it refuses a sign-in with, deliberately, so
     /// that a prober cannot tell a deployment with no OAuth app from one whose allowlist they
     /// are not on. This side is not a prober and can simply try the other door.
+    ///
+    /// A 404 falls back too, with its own sentence. A stele server that predates the device
+    /// flow answers this path with its uniform 404 — the same page it gives every unknown
+    /// slug, deliberately, so the route's absence is not a probe result either — and for as
+    /// long as such servers exist, "this CLI is newer than that server" is the likeliest
+    /// meaning of the status. The generic notFound error would read as "wrong host", which
+    /// sends the person auditing the URL they typed instead of updating the deployment; the
+    /// token prompt is the door that still works on exactly those servers.
     private func beginSignIn(on host: SteleHost, client: SteleClient) async throws
         -> DeviceCodeBundle?
     {
@@ -129,17 +137,31 @@ struct LoginCommand: SteleCommand {
         do {
             bundle = try await client.startDeviceSignIn()
         } catch let error as SteleError {
-            guard case .unauthorized = error else { throw error }
             // Said before the prompt appears, because a person who ran this expecting a browser
-            // and got a token prompt deserves to know which of the two happened. Hedged on
-            // purpose: all this side knows is that the deployment declined, and the server does
-            // not say why — the caller here is a human at their own terminal rather than a
-            // prober, but the answer is the same bytes either way.
-            Terminal.error(
-                options.style.dim(
-                    "\(host) did not offer a GitHub sign-in — asking for a token instead."
+            // and got a token prompt deserves to know which of the two happened. The two
+            // sentences are hedged differently on purpose. A 401 is a deployment that answered
+            // and declined, and the server does not say why — the caller here is a human at
+            // their own terminal rather than a prober, but the answer is the same bytes either
+            // way. A 404 is a server that has never heard of the route, and the version gap is
+            // named as a maybe rather than a fact: all this side has seen is a status code that
+            // an arbitrary non-stele host would also produce.
+            switch error {
+            case .unauthorized:
+                Terminal.error(
+                    options.style.dim(
+                        "\(host) did not offer a GitHub sign-in — asking for a token instead."
+                    )
                 )
-            )
+            case .notFound:
+                Terminal.error(
+                    options.style.dim(
+                        "\(host) has no sign-in route — the server may predate the device "
+                            + "flow. Asking for a token instead."
+                    )
+                )
+            default:
+                throw error
+            }
             return nil
         }
 
