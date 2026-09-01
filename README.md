@@ -487,3 +487,7 @@ Two things it does not do, stated because a canary you trust wrongly is worse th
 It also moves `~/.config/stele/credentials.json` aside and restores it on every exit path,
 including a failed check — see the `HOME` note under Configuration for why it cannot simply use a
 temp directory instead.
+
+## License
+
+[MIT](LICENSE)
